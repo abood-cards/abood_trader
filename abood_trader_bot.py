@@ -2,7 +2,6 @@ import asyncio
 import inspect
 import json
 import os
-import statistics
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -14,11 +13,14 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
 # ==========================================
-# 1. إعدادات الربط الأساسية (تعمل محليًا وعلى Render)
+# 1. إعدادات الربط والتوقيت (عدّلها بسهولة من هنا)
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
-CHANNEL_ID = os.getenv("CHANNEL_ID", -1004457492083)
+CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
+
+# المتغير الثابت للتقديم قبل إغلاق الشمعة بأجزاء الثانية (مثلاً 0.25 أو 0.3 أو 0.15)
+DEFAULT_LEAD_SECONDS = 0.25
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
@@ -90,7 +92,7 @@ class AboodControlBot:
         self.global_steps = 6
         self.pair_steps = 4
         self.min_payout = 90
-        self.entry_lead_seconds = 0.25
+        self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
         self.auth_frame = DEFAULT_AUTH_FRAME
 
         # نطاق المسح: "CURRENCIES" | "CRYPTO" | "STOCKS" | "CURR_CRYPTO" | "ALL"
@@ -117,10 +119,6 @@ class AboodControlBot:
         self.ws = None
         self.http_session = None
         self.req_index = 100
-
-        # معايرة توقيت السيرفر بدقة باستخدام الوسيط الإحصائي (Median)
-        self.offset_samples = []
-        self.server_time_offset = 0.0
         self.demo_balance = None
 
         # حالات التداول
@@ -179,7 +177,8 @@ class AboodControlBot:
         return "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 
     def get_server_now(self) -> float:
-        return time.time() + self.server_time_offset
+        # الاعتماد المباشر على الساعة العالمية الدقيقة لسيرفر Render بدون أي إزاحة إضافية
+        return time.time()
 
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
@@ -619,13 +618,6 @@ class AboodControlBot:
         if asset not in self.candles:
             self.candles[asset] = {}
         ts = normalize_ts(raw_ts)
-
-        sample = ts - time.time()
-        self.offset_samples.append(sample)
-        if len(self.offset_samples) > 25:
-            self.offset_samples.pop(0)
-        self.server_time_offset = statistics.median(self.offset_samples)
-
         self.latest_prices[asset] = price
 
         minute_ts = (int(ts) // 60) * 60
@@ -1114,7 +1106,6 @@ class AboodControlBot:
 
             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
 
-            # توافق تلقائي مع إصدار مكتبة websockets على Render والمحلي
             ws_params = inspect.signature(websockets.connect).parameters
             header_key = "additional_headers" if "additional_headers" in ws_params else "extra_headers"
 
