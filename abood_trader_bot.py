@@ -19,8 +19,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تل�
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
-# المتغير الثابت للتقديم قبل إغلاق الشمعة بأجزاء الثانية (مثلاً 0.25 أو 0.3 أو 0.15)
+# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة بأجزاء الثانية (0.25 = ربع ثانية قبل الإغلاق)
 DEFAULT_LEAD_SECONDS = 0.25
+
+# تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option لمنع التقديم ثانية كاملة
+SERVER_CLOCK_OFFSET = 0.75
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
@@ -180,7 +183,6 @@ class AboodControlBot:
         return "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 
     def get_server_now(self) -> float:
-        # الساعة العالمية الدقيقة لـ Render + فرق الساعات الكاملة لسيرفر المنصة فقط (بدون أي ثوانٍ زائدة)
         return time.time() + self.server_hour_shift
 
     def switch_pair_keep_global(self, reason: str):
@@ -280,7 +282,7 @@ class AboodControlBot:
             f"💵 <b>المبلغ الأساسي:</b> <code>${self.base_amount:g}</code>\n"
             f"🌐 <b>التدبيل العام ({self.global_steps}):</b> <code>{ladder_str}</code>\n"
             f"🏛 <b>تدبيل الزوج الواحد:</b> <code>{self.pair_steps} محاولات كحد أقصى</code>\n"
-            f"⏱ <b>التقديم قبل الإغلاق:</b> <code>{self.entry_lead_seconds} ثانية</code>\n"
+            f"⏱ <b>الفحص والدخول قبل الإغلاق:</b> <code>{self.entry_lead_seconds} ثانية</code>\n"
             f"📢 <b>قناة الإشارات:</b> <code>{CHANNEL_ID}</code>"
         )
 
@@ -391,7 +393,7 @@ class AboodControlBot:
                             continue
                         elif data == "set_lead":
                             self.awaiting_input = "LEAD_TIME"
-                            await self.send_admin("⏱ أرسل الآن <b>التقديم قبل الإغلاق بأجزاء الثانية</b> (مثال: <code>0.25</code> أو <code>0.3</code>):")
+                            await self.send_admin("⏱ أرسل الآن <b>الفحص والدخول قبل الإغلاق بأجزاء الثانية</b> (مثال: <code>0.25</code> أو <code>0.15</code>):")
                             continue
                         elif data == "set_auth":
                             self.awaiting_input = "AUTH"
@@ -493,13 +495,15 @@ class AboodControlBot:
                         elif self.awaiting_input == "LEAD_TIME":
                             try:
                                 lt = float(text)
-                                if 0.0 <= lt <= 3.0:
+                                if -1.0 <= lt <= 3.0:
                                     self.entry_lead_seconds = lt
                                     self.awaiting_input = None
                                     await self.send_admin(
-                                        f"✅ تم ضبط التقديم قبل الإغلاق إلى <b>{lt} ثانية</b>.",
+                                        f"✅ تم ضبط الفحص والدخول قبل الإغلاق إلى <b>{lt} ثانية</b>.",
                                         self.build_main_keyboard()
                                     )
+                                else:
+                                    await self.send_admin("⚠️ أدخل قيمة بين -1.0 و 3.0 ثانية:")
                             except ValueError:
                                 await self.send_admin("⚠️ أرسل رقمًا عشريًا (مثال: <code>0.25</code>):")
 
@@ -622,7 +626,6 @@ class AboodControlBot:
             self.candles[asset] = {}
         ts = normalize_ts(raw_ts)
 
-        # حساب فرق الساعات الكاملة فقط (مقربًا لأقرب ساعة = 3600 ثانية) بدون إضافة أي ثوانٍ
         raw_diff = ts - time.time()
         self.server_hour_shift = round(raw_diff / 3600.0) * 3600.0
 
@@ -666,7 +669,6 @@ class AboodControlBot:
             return
         self.last_logged_state[asset] = state_signature
 
-        # عرض أوقات الشموع بتوقيتك المحلي (UTC+3) المطابق لساعة المنصة
         shift = self.server_hour_shift
         t4 = datetime.fromtimestamp(m4 - shift, tz=TZ_UTC3).strftime("%H:%M")
         t3 = datetime.fromtimestamp(m3 - shift, tz=TZ_UTC3).strftime("%H:%M")
@@ -762,9 +764,9 @@ class AboodControlBot:
 
             server_now = self.get_server_now()
 
-            # 1) فحص الشمعة الخامسة قبل الإغلاق بأجزاء الثانية الدقيقة
+            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية (بإزاحة تعويض الساعة لمنع التقديم ثانية كاملة)
             if self.mode == "LOCKED" and self.locked_target_minute:
-                candle_close_ts = self.locked_target_minute + 60.0
+                candle_close_ts = self.locked_target_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = candle_close_ts - server_now
 
                 if remaining > 2.0:
@@ -828,9 +830,9 @@ class AboodControlBot:
                         ))
                         self.switch_pair_keep_global("أغلقت خضراء عكس الشرط")
 
-            # 2) فحص الصفقة المفتوحة قبل إغلاقها لتطبيق منطق التدبيل المزدوج
+            # 2) فحص الصفقة المفتوحة في آخر أجزاء من الثانية لتطبيق التدبيل أو النتيجة بدقة
             elif self.mode == "IN_TRADE" and self.active_trade_minute:
-                trade_close_ts = self.active_trade_minute + 60.0
+                trade_close_ts = self.active_trade_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = trade_close_ts - server_now
 
                 if remaining > 2.0:
@@ -912,11 +914,10 @@ class AboodControlBot:
             (m4, m3, m2, m1, m_open), (c4, c3, c2, c1, c_open) = data
 
             server_now = self.get_server_now()
-            if (m_open + 60.0 - server_now) <= (self.entry_lead_seconds + 0.5):
+            if (m_open + 60.0 + SERVER_CLOCK_OFFSET - server_now) <= (self.entry_lead_seconds + 0.5):
                 return
 
             sig_sym = self.format_signal_symbol(asset)
-            # تحويل وقت الدخول الفعلي إلى توقيت UTC+3 الصحيح
             real_entry_ts = (m_open + 60) - self.server_hour_shift
             entry_time_str = datetime.fromtimestamp(real_entry_ts, tz=TZ_UTC3).strftime("%H:%M:%S")
 
