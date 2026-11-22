@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import statistics
@@ -619,7 +620,6 @@ class AboodControlBot:
             self.candles[asset] = {}
         ts = normalize_ts(raw_ts)
 
-        # حساب فرق التوقيت الحقيقي بالوسيط الإحصائي لتجنب القفزات (ثانية كاملة)
         sample = ts - time.time()
         self.offset_samples.append(sample)
         if len(self.offset_samples) > 25:
@@ -760,7 +760,7 @@ class AboodControlBot:
 
             server_now = self.get_server_now()
 
-            # 1) فحص الشمعة الخامسة قبل الإغلاق بأجزاء الثانية الدقيقة (self.entry_lead_seconds)
+            # 1) فحص الشمعة الخامسة قبل الإغلاق بأجزاء الثانية الدقيقة
             if self.mode == "LOCKED" and self.locked_target_minute:
                 candle_close_ts = self.locked_target_minute + 60.0
                 remaining = candle_close_ts - server_now
@@ -1114,6 +1114,10 @@ class AboodControlBot:
 
             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
 
+            # توافق تلقائي مع إصدار مكتبة websockets على Render والمحلي
+            ws_params = inspect.signature(websockets.connect).parameters
+            header_key = "additional_headers" if "additional_headers" in ws_params else "extra_headers"
+
             while True:
                 self.authenticated = False
                 self.subscribed_pairs.clear()
@@ -1123,12 +1127,12 @@ class AboodControlBot:
                 ws_url = self.get_ws_url()
                 try:
                     log("WS", f"جاري الاتصال بسيرفر السوق: {ws_url}")
-                    async with websockets.connect(
-                        ws_url,
-                        additional_headers=headers,
-                        ping_interval=None,
-                        close_timeout=5
-                    ) as ws:
+                    connect_kwargs = {
+                        header_key: headers,
+                        "ping_interval": None,
+                        "close_timeout": 5
+                    }
+                    async with websockets.connect(ws_url, **connect_kwargs) as ws:
                         self.ws = ws
                         log("WS", "تم فتح اتصال WebSocket بنجاح...")
                         hb_task = asyncio.create_task(self.keepalive_heartbeat_loop(ws))
