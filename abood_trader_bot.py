@@ -19,10 +19,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تل�
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
-# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة بأجزاء الثانية (0.25 = ربع ثانية قبل الإغلاق)
+# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة بأجزاء الثانية
 DEFAULT_LEAD_SECONDS = 0.25
 
-# تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option لمنع التقديم ثانية كاملة
+# تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
 SERVER_CLOCK_OFFSET = 0.75
 
 DEFAULT_AUTH_FRAME = os.getenv(
@@ -87,6 +87,14 @@ def color_label(color: str) -> str:
     return "⚪ غير متاح"
 
 
+def make_progress_bar(count: int, total: int, length: int = 10) -> str:
+    if total <= 0 or count <= 0:
+        return "░" * length
+    filled = max(1, round((count / total) * length)) if count > 0 else 0
+    filled = min(length, filled)
+    return "█" * filled + "░" * (length - filled)
+
+
 class AboodControlBot:
     def __init__(self):
         # الإعدادات القابلة للتحكم من تليجرام
@@ -98,7 +106,7 @@ class AboodControlBot:
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
         self.auth_frame = DEFAULT_AUTH_FRAME
 
-        # نطاق المسح: "CURRENCIES" | "CRYPTO" | "STOCKS" | "CURR_CRYPTO" | "ALL"
+        # نطاق المسح
         self.scan_scope = "CURRENCIES"
 
         self.assets_by_cat = {
@@ -123,8 +131,6 @@ class AboodControlBot:
         self.http_session = None
         self.req_index = 100
         self.demo_balance = None
-
-        # فرق الساعات الكاملة فقط بين سيرفر المنصة والساعة العالمية (مثلاً 7200 ثانية = ساعتان)
         self.server_hour_shift = 0.0
 
         # حالات التداول
@@ -137,6 +143,131 @@ class AboodControlBot:
         self.pair_step_index = 0
         self.active_trade_minute = None
         self.trade_entry_price = None
+
+        # سجل الإحصائيات اليومية (Daily Results)
+        self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
+        self.daily_records = []  # عناصر مثل: {"pair": "EURUSD-OTC", "result": "WIN", "step": 1}
+
+    def record_trade_outcome(self, pair_name: str, is_win: bool, attempt_num: int):
+        """تسجيل نتيجة الصفقة في إحصائيات اليوم"""
+        today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
+        if today_str != self.stats_date:
+            self.stats_date = today_str
+            self.daily_records.clear()
+
+        self.daily_records.append({
+            "pair": pair_name,
+            "result": "WIN" if is_win else "LOSS",
+            "step": attempt_num
+        })
+
+    def format_daily_stats_report(self) -> str:
+        """بناء تقرير الإحصائيات اليومية بنفس تنسيق وتفاصيل الصورة تمامًا"""
+        now_dt = datetime.now(tz=TZ_UTC3)
+        days_ar = {
+            "Monday": "الإثنين", "Tuesday": "الثلاثاء", "Wednesday": "الأربعاء",
+            "Thursday": "الخميس", "Friday": "الجمعة", "Saturday": "السبت", "Sunday": "الأحد"
+        }
+        day_name = days_ar.get(now_dt.strftime("%A"), now_dt.strftime("%A"))
+        date_header = f"{now_dt.strftime('%d %b %Y')} • {day_name}"
+
+        total_signals = len(self.daily_records)
+        wins = [r for r in self.daily_records if r["result"] == "WIN"]
+        losses = [r for r in self.daily_records if r["result"] == "LOSS"]
+
+        win_count = len(wins)
+        loss_count = len(losses)
+        win_rate = (win_count / total_signals * 100.0) if total_signals > 0 else 0.0
+
+        # تفصيل حسب مستوى التدبيل (SURE SHOT / MTG 1 / MTG 2 / MTG 3+)
+        sure_shot = sum(1 for r in wins if r["step"] == 1)
+        mtg1 = sum(1 for r in wins if r["step"] == 2)
+        mtg2 = sum(1 for r in wins if r["step"] == 3)
+        mtg3_plus = sum(1 for r in wins if r["step"] >= 4)
+
+        def pct(val: int) -> int:
+            return round((val / total_signals) * 100) if total_signals > 0 else 0
+
+        # حساب أطول سلسلة انتصارات متتالية (BEST STREAK)
+        best_streak = 0
+        curr_streak = 0
+        for r in self.daily_records:
+            if r["result"] == "WIN":
+                curr_streak += 1
+                if curr_streak > best_streak:
+                    best_streak = curr_streak
+            else:
+                curr_streak = 0
+
+        # بناء شبكة الخط الزمني للصفقات (TRADE TIMELINE) — 10 رموز في كل سطر
+        timeline_icons = []
+        step_badges = {1: "✅", 2: "1️⃣", 3: "2️⃣", 4: "3️⃣", 5: "4️⃣", 6: "5️⃣"}
+        for r in self.daily_records:
+            if r["result"] == "WIN":
+                timeline_icons.append(step_badges.get(r["step"], "✅"))
+            else:
+                timeline_icons.append("❌")
+
+        if timeline_icons:
+            rows = [
+                " ".join(timeline_icons[i:i + 10])
+                for i in range(0, len(timeline_icons), 10)
+            ]
+            timeline_block = "\n".join(f"┃ {row}" for row in rows)
+        else:
+            timeline_block = "┃ <i>لا توجد صفقات مسجلة اليوم بعد</i>"
+
+        # حساب أفضل الأزواج أداءً (TOP PAIRS)
+        pair_stats = {}
+        for r in self.daily_records:
+            p = r["pair"]
+            if p not in pair_stats:
+                pair_stats[p] = {"wins": 0, "total": 0}
+            pair_stats[p]["total"] += 1
+            if r["result"] == "WIN":
+                pair_stats[p]["wins"] += 1
+
+        sorted_pairs = sorted(
+            pair_stats.items(),
+            key=lambda x: (x[1]["wins"], x[1]["wins"] / x[1]["total"]),
+            reverse=True
+        )[:3]
+
+        if sorted_pairs:
+            top_pairs_str = "  |  ".join(
+                f"<code>{p}</code> ({d['wins']}/{d['total']})" for p, d in sorted_pairs
+            )
+        else:
+            top_pairs_str = "لا يوجد بعد"
+
+        mtg3_line = (
+            f"┃ 🔵 <b>MTG 3+</b>    {make_progress_bar(mtg3_plus, total_signals)}  <b>{mtg3_plus}</b> ({pct(mtg3_plus)}%)\n"
+            if mtg3_plus > 0 else ""
+        )
+
+        return (
+            f"╭━━━[ 🛡 <b>عبود تريدينج</b> ]━━━╮\n"
+            f"┃ 📊 <b>DAILY RESULTS — النتائج اليومية</b>\n"
+            f"┃ 📅 <code>{date_header}</code>\n"
+            f"┃ ⏱ POCKET OPTION • M1\n"
+            f"┣━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+            f"┃ 🎯 <b>WIN RATE:</b> <b>{win_rate:.1f}%</b>  |  📡 <b>SIGNALS:</b> <b>{total_signals}</b>\n"
+            f"┃ 🟢 <b>{win_count} WINS</b>      🔴 <b>{loss_count} LOSSES</b>\n"
+            f"┣━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+            f"┃ 📋 <b>BREAKDOWN</b>   |   🔥 <b>BEST STREAK: {best_streak} WINS</b>\n"
+            f"┃ 🟢 <b>SURE SHOT</b>  {make_progress_bar(sure_shot, total_signals)}  <b>{sure_shot}</b> ({pct(sure_shot)}%)\n"
+            f"┃ 🟡 <b>MTG 1</b>         {make_progress_bar(mtg1, total_signals)}  <b>{mtg1}</b> ({pct(mtg1)}%)\n"
+            f"┃ 🟠 <b>MTG 2</b>         {make_progress_bar(mtg2, total_signals)}  <b>{mtg2}</b> ({pct(mtg2)}%)\n"
+            f"{mtg3_line}"
+            f"┃ 🔴 <b>LOSS</b>           {make_progress_bar(loss_count, total_signals)}  <b>{loss_count}</b> ({pct(loss_count)}%)\n"
+            f"┣━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+            f"┃ 🕒 <b>TRADE TIMELINE</b> (✅ أساسي | 1️⃣2️⃣ تدبيل | ❌ خسارة)\n"
+            f"{timeline_block}\n"
+            f"┣━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+            f"┃ 🏆 <b>TOP PAIRS:</b>\n"
+            f"┃ {top_pairs_str}\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━╯"
+        )
 
     def get_scope_label(self) -> str:
         labels = {
@@ -230,6 +361,10 @@ class AboodControlBot:
                 [
                     {"text": f"⏱ التقديم ({self.entry_lead_seconds}ث)", "callback_data": "set_lead"},
                     {"text": "🔑 تحديث الجلسة", "callback_data": "set_auth"}
+                ],
+                [
+                    {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"},
+                    {"text": "📢 نشر الإحصائيات بالقناة", "callback_data": "stats_publish"}
                 ]
             ]
         }
@@ -260,6 +395,10 @@ class AboodControlBot:
         active_pairs = self.get_active_scan_pairs()
         eligible_count = sum(1 for p in active_pairs if self.payouts.get(p, 0) >= self.min_payout)
 
+        total_today = len(self.daily_records)
+        wins_today = sum(1 for r in self.daily_records if r["result"] == "WIN")
+        rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
+
         mode_ar = {
             "SCANNING": f"🔍 يبحث عن فرصة (الدخول القادم: ${current_next_amt})",
             "LOCKED": f"🎯 مثبّت على {self.format_signal_symbol(self.locked_pair or '')} (الدخول: ${current_next_amt})",
@@ -276,9 +415,10 @@ class AboodControlBot:
             f"🌐 <b>السيرفر:</b> {conn_icon}\n"
             f"💰 <b>رصيد الديمو:</b> <code>{bal_str}</code>\n"
             f"📍 <b>النشاط:</b> {mode_ar}\n"
+            f"📊 <b>إحصائيات اليوم:</b> <code>{wins_today}/{total_today}</code> ({rate_today:.1f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
-            f"📊 <b>الأصول المؤهلة (≥{self.min_payout}%):</b> <code>{eligible_count}</code> من {len(active_pairs)}\n"
+            f"📈 <b>الأصول المؤهلة (≥{self.min_payout}%):</b> <code>{eligible_count}</code> من {len(active_pairs)}\n"
             f"💵 <b>المبلغ الأساسي:</b> <code>${self.base_amount:g}</code>\n"
             f"🌐 <b>التدبيل العام ({self.global_steps}):</b> <code>{ladder_str}</code>\n"
             f"🏛 <b>تدبيل الزوج الواحد:</b> <code>{self.pair_steps} محاولات كحد أقصى</code>\n"
@@ -327,6 +467,20 @@ class AboodControlBot:
         else:
             log("CHANNEL_ERR", f"فشل النشر في القناة: {res}")
 
+    async def daily_midnight_stats_scheduler(self):
+        """جدولة النشر التلقائي للإحصائيات اليومية عند منتصف الليل (00:00 UTC+3)"""
+        while True:
+            await asyncio.sleep(20)
+            now_dt = datetime.now(tz=TZ_UTC3)
+            today_str = now_dt.strftime("%Y-%m-%d")
+            if today_str != self.stats_date:
+                if self.daily_records:
+                    report = self.format_daily_stats_report()
+                    await self.send_channel(report)
+                    await self.send_admin("📊 تم نشر التقرير اليومي تلقائيًا في القناة وتصفير عداد اليوم الجديد ✅")
+                self.stats_date = today_str
+                self.daily_records.clear()
+
     async def telegram_polling_loop(self):
         offset = 0
         log("TG", "بوت الإدارة جاهز ✅ أرسل /start في الخاص لفتح لوحة التحكم.")
@@ -361,6 +515,14 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "stats_preview":
+                            await self.send_admin(self.format_daily_stats_report())
+                            continue
+                        elif data == "stats_publish":
+                            report = self.format_daily_stats_report()
+                            await self.send_channel(report)
+                            await self.send_admin("✅ تم نشر تقرير الإحصائيات اليومية في القناة بنجاح!")
+                            continue
                         elif data == "menu_scope":
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
@@ -432,6 +594,10 @@ class AboodControlBot:
                         if text in ("/start", "/menu", "القائمة"):
                             self.awaiting_input = None
                             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
+                            continue
+
+                        if text in ("/stats", "الاحصائيات", "الإحصائيات"):
+                            await self.send_admin(self.format_daily_stats_report())
                             continue
 
                         if self.awaiting_input == "BASE_AMOUNT":
@@ -764,7 +930,7 @@ class AboodControlBot:
 
             server_now = self.get_server_now()
 
-            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية (بإزاحة تعويض الساعة لمنع التقديم ثانية كاملة)
+            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية
             if self.mode == "LOCKED" and self.locked_target_minute:
                 candle_close_ts = self.locked_target_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = candle_close_ts - server_now
@@ -830,7 +996,7 @@ class AboodControlBot:
                         ))
                         self.switch_pair_keep_global("أغلقت خضراء عكس الشرط")
 
-            # 2) فحص الصفقة المفتوحة في آخر أجزاء من الثانية لتطبيق التدبيل أو النتيجة بدقة
+            # 2) فحص الصفقة المفتوحة في آخر أجزاء من الثانية
             elif self.mode == "IN_TRADE" and self.active_trade_minute:
                 trade_close_ts = self.active_trade_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = trade_close_ts - server_now
@@ -857,6 +1023,7 @@ class AboodControlBot:
                 )
 
                 if is_win:
+                    self.record_trade_outcome(sig_sym, is_win=True, attempt_num=attempt_num)
                     win_msg = (
                         f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                         f"┃ 🏛 <code>{sig_sym}</code>\n"
@@ -872,6 +1039,7 @@ class AboodControlBot:
                 next_minute = self.active_trade_minute + 60
 
                 if next_g_idx >= self.global_steps:
+                    self.record_trade_outcome(sig_sym, is_win=False, attempt_num=attempt_num)
                     loss_msg = (
                         f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                         f"┃ 🏛 <code>{sig_sym}</code>\n"
@@ -1115,6 +1283,7 @@ class AboodControlBot:
             self.http_session = http_session
             asyncio.create_task(self.telegram_polling_loop())
             asyncio.create_task(self.precision_entry_watcher())
+            asyncio.create_task(self.daily_midnight_stats_scheduler())
 
             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
 
