@@ -18,7 +18,7 @@ if sys.stdout.encoding != "utf-8":
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
-CHANNEL_ID = os.getenv("CHANNEL_ID", 1004457492083)
+CHANNEL_ID = os.getenv("CHANNEL_ID", -1004457492083)
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
