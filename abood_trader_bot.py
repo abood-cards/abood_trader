@@ -121,6 +121,9 @@ class AboodControlBot:
         self.req_index = 100
         self.demo_balance = None
 
+        # فرق الساعات الكاملة فقط بين سيرفر المنصة والساعة العالمية (مثلاً 7200 ثانية = ساعتان)
+        self.server_hour_shift = 0.0
+
         # حالات التداول
         self.mode = "SCANNING"
         self.locked_pair = None
@@ -177,8 +180,8 @@ class AboodControlBot:
         return "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 
     def get_server_now(self) -> float:
-        # الاعتماد المباشر على الساعة العالمية الدقيقة لسيرفر Render بدون أي إزاحة إضافية
-        return time.time()
+        # الساعة العالمية الدقيقة لـ Render + فرق الساعات الكاملة لسيرفر المنصة فقط (بدون أي ثوانٍ زائدة)
+        return time.time() + self.server_hour_shift
 
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
@@ -618,6 +621,11 @@ class AboodControlBot:
         if asset not in self.candles:
             self.candles[asset] = {}
         ts = normalize_ts(raw_ts)
+
+        # حساب فرق الساعات الكاملة فقط (مقربًا لأقرب ساعة = 3600 ثانية) بدون إضافة أي ثوانٍ
+        raw_diff = ts - time.time()
+        self.server_hour_shift = round(raw_diff / 3600.0) * 3600.0
+
         self.latest_prices[asset] = price
 
         minute_ts = (int(ts) // 60) * 60
@@ -658,11 +666,13 @@ class AboodControlBot:
             return
         self.last_logged_state[asset] = state_signature
 
-        t4 = datetime.fromtimestamp(m4, tz=TZ_UTC3).strftime("%H:%M")
-        t3 = datetime.fromtimestamp(m3, tz=TZ_UTC3).strftime("%H:%M")
-        t2 = datetime.fromtimestamp(m2, tz=TZ_UTC3).strftime("%H:%M")
-        t1 = datetime.fromtimestamp(m1, tz=TZ_UTC3).strftime("%H:%M")
-        t_open = datetime.fromtimestamp(m_open, tz=TZ_UTC3).strftime("%H:%M")
+        # عرض أوقات الشموع بتوقيتك المحلي (UTC+3) المطابق لساعة المنصة
+        shift = self.server_hour_shift
+        t4 = datetime.fromtimestamp(m4 - shift, tz=TZ_UTC3).strftime("%H:%M")
+        t3 = datetime.fromtimestamp(m3 - shift, tz=TZ_UTC3).strftime("%H:%M")
+        t2 = datetime.fromtimestamp(m2 - shift, tz=TZ_UTC3).strftime("%H:%M")
+        t1 = datetime.fromtimestamp(m1 - shift, tz=TZ_UTC3).strftime("%H:%M")
+        t_open = datetime.fromtimestamp(m_open - shift, tz=TZ_UTC3).strftime("%H:%M")
 
         log(
             "5-CANDLES",
@@ -906,8 +916,9 @@ class AboodControlBot:
                 return
 
             sig_sym = self.format_signal_symbol(asset)
-            entry_ts = m_open + 60
-            entry_time_str = datetime.fromtimestamp(entry_ts, tz=TZ_UTC3).strftime("%H:%M:%S")
+            # تحويل وقت الدخول الفعلي إلى توقيت UTC+3 الصحيح
+            real_entry_ts = (m_open + 60) - self.server_hour_shift
+            entry_time_str = datetime.fromtimestamp(real_entry_ts, tz=TZ_UTC3).strftime("%H:%M:%S")
 
             # شرط البيع: أحمر -> أحمر -> أخضر -> أحمر
             if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
@@ -916,7 +927,7 @@ class AboodControlBot:
                 self.locked_direction = "put"
                 self.locked_target_minute = m_open
                 self.pair_step_index = 0
-                log("LOCK", f"🎯 رصد نموذج بيع على {sig_sym} ({payout}%) | الدخول: {entry_time_str}")
+                log("LOCK", f"🎯 رصد نموذج بيع على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
 
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
@@ -937,7 +948,7 @@ class AboodControlBot:
                 self.locked_direction = "call"
                 self.locked_target_minute = m_open
                 self.pair_step_index = 0
-                log("LOCK", f"🎯 رصد نموذج شراء على {sig_sym} ({payout}%) | الدخول: {entry_time_str}")
+                log("LOCK", f"🎯 رصد نموذج شراء على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
 
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
