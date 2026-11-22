@@ -180,8 +180,7 @@ class AboodControlBot:
         return "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 
     def get_server_now(self) -> float:
-        # الساعة العالمية الدقيقة لـ Render + فرق الساعات الكاملة لسيرفر المنصة فقط (بدون أي ثوانٍ زائدة)
-        return time.time() + self.server_hour_shift
+        return time.time() + self.server_time_offset
 
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
@@ -622,19 +621,18 @@ class AboodControlBot:
             self.candles[asset] = {}
         ts = normalize_ts(raw_ts)
 
-        # حساب فرق الساعات الكاملة فقط (مقربًا لأقرب ساعة = 3600 ثانية) بدون إضافة أي ثوانٍ
+        # حساب الفرق الدقيق بالثواني وأجزاء الثانية بين ساعة المنصة وساعة السيرفر
         raw_diff = ts - time.time()
-        self.server_hour_shift = round(raw_diff / 3600.0) * 3600.0
+        if not hasattr(self, "offset_samples"):
+            self.offset_samples = []
+        self.offset_samples.append(raw_diff)
+        if len(self.offset_samples) > 30:
+            self.offset_samples.pop(0)
+        # أخذ المتوسط الحسابي لآخر 30 تكة لضبط ساعة الشموع بدقة
+        self.server_time_offset = sum(self.offset_samples) / len(self.offset_samples)
+        self.server_hour_shift = round(self.server_time_offset / 3600.0) * 3600.0
 
         self.latest_prices[asset] = price
-
-        minute_ts = (int(ts) // 60) * 60
-        bucket = self.candles[asset].get(minute_ts)
-        if bucket is None:
-            self.candles[asset][minute_ts] = {"open": price, "close": price}
-        else:
-            bucket["close"] = price
-
         if len(self.candles[asset]) > 120:
             oldest_keys = sorted(self.candles[asset].keys())[:-100]
             for k in oldest_keys:
