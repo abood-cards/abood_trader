@@ -26,7 +26,7 @@ DEFAULT_LEAD_SECONDS = 0.1
 SERVER_CLOCK_OFFSET = 0.75
 
 # تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة بدقة ومنع تقدمها ثانية كاملة
-MARTINGALE_OFFSET = 0.15
+MARTINGALE_OFFSET = 0.05
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
