@@ -21,7 +21,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية
 DEFAULT_LEAD_SECONDS = 0.10
-
+# تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة (ارفع الرقم لتأخير التدبيلة أكثر، وقلّله لتقديمها)
+MARTINGALE_OFFSET = 0.40
 # تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
 SERVER_CLOCK_OFFSET = 0.75
 
@@ -869,7 +870,7 @@ class AboodControlBot:
         self.pair_step_index = p_idx
         self.active_trade_minute = trade_minute
         # وقت إغلاق مبدئي من لحظة فتح الصفقة (ويُحدّث فورًا بالوقت الدقيق من successopenOrder)
-        self.active_trade_close_ts = self.get_server_now() + TRADE_DURATION
+        self.active_trade_close_ts = self.get_server_now() + TRADE_DURATION + MARTINGALE_OFFSET
         self.trade_entry_price = self.latest_prices.get(asset)
         self.mode = "IN_TRADE"
 
@@ -1170,14 +1171,8 @@ class AboodControlBot:
             return
 
         if event_name == "successopenOrder" and isinstance(data, dict):
-            # التقاط سعر فتح الصفقة الفعلي ووقت إغلاقها الفعلي من السيرفر مباشرة
             if data.get("openPrice") is not None:
                 self.trade_entry_price = float(data["openPrice"])
-            if data.get("closeTimestamp") is not None:
-                self.active_trade_close_ts = normalize_ts(data["closeTimestamp"])
-            elif data.get("openTimestamp") is not None:
-                self.active_trade_close_ts = normalize_ts(data["openTimestamp"]) + TRADE_DURATION
-
             log(
                 "ORDER_OK",
                 f"تأكيد السيرفر | ID: {data.get('id')} | المبلغ: ${data.get('amount')} | "
