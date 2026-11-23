@@ -19,7 +19,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تل�
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
-# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة بأجزاء الثانية
+# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية
 DEFAULT_LEAD_SECONDS = 0.25
 
 # تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
@@ -142,14 +142,14 @@ class AboodControlBot:
         self.global_step_index = 0
         self.pair_step_index = 0
         self.active_trade_minute = None
-        self.trade_entry_price = None
+        self.active_trade_close_ts = None   # وقت إغلاق الصفقة الفعلي بناءً على لحظة فتحها
+        self.trade_entry_price = None       # سعر فتح الصفقة الفعلي من السيرفر
 
         # سجل الإحصائيات اليومية (Daily Results)
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
-        self.daily_records = []  # عناصر مثل: {"pair": "EURUSD-OTC", "result": "WIN", "step": 1}
+        self.daily_records = []
 
     def record_trade_outcome(self, pair_name: str, is_win: bool, attempt_num: int):
-        """تسجيل نتيجة الصفقة في إحصائيات اليوم"""
         today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         if today_str != self.stats_date:
             self.stats_date = today_str
@@ -162,7 +162,6 @@ class AboodControlBot:
         })
 
     def format_daily_stats_report(self) -> str:
-        """بناء تقرير الإحصائيات اليومية بنفس تنسيق وتفاصيل الصورة تمامًا"""
         now_dt = datetime.now(tz=TZ_UTC3)
         days_ar = {
             "Monday": "الإثنين", "Tuesday": "الثلاثاء", "Wednesday": "الأربعاء",
@@ -179,7 +178,6 @@ class AboodControlBot:
         loss_count = len(losses)
         win_rate = (win_count / total_signals * 100.0) if total_signals > 0 else 0.0
 
-        # تفصيل حسب مستوى التدبيل (SURE SHOT / MTG 1 / MTG 2 / MTG 3+)
         sure_shot = sum(1 for r in wins if r["step"] == 1)
         mtg1 = sum(1 for r in wins if r["step"] == 2)
         mtg2 = sum(1 for r in wins if r["step"] == 3)
@@ -188,7 +186,6 @@ class AboodControlBot:
         def pct(val: int) -> int:
             return round((val / total_signals) * 100) if total_signals > 0 else 0
 
-        # حساب أطول سلسلة انتصارات متتالية (BEST STREAK)
         best_streak = 0
         curr_streak = 0
         for r in self.daily_records:
@@ -199,7 +196,6 @@ class AboodControlBot:
             else:
                 curr_streak = 0
 
-        # بناء شبكة الخط الزمني للصفقات (TRADE TIMELINE) — 10 رموز في كل سطر
         timeline_icons = []
         step_badges = {1: "✅", 2: "1️⃣", 3: "2️⃣", 4: "3️⃣", 5: "4️⃣", 6: "5️⃣"}
         for r in self.daily_records:
@@ -217,7 +213,6 @@ class AboodControlBot:
         else:
             timeline_block = "┃ <i>لا توجد صفقات مسجلة اليوم بعد</i>"
 
-        # حساب أفضل الأزواج أداءً (TOP PAIRS)
         pair_stats = {}
         for r in self.daily_records:
             p = r["pair"]
@@ -324,6 +319,7 @@ class AboodControlBot:
         self.locked_target_minute = None
         self.pair_step_index = 0
         self.active_trade_minute = None
+        self.active_trade_close_ts = None
         self.trade_entry_price = None
 
     def full_reset_to_scanning(self, reason: str):
@@ -335,6 +331,7 @@ class AboodControlBot:
         self.global_step_index = 0
         self.pair_step_index = 0
         self.active_trade_minute = None
+        self.active_trade_close_ts = None
         self.trade_entry_price = None
 
     # ==========================================
@@ -468,7 +465,6 @@ class AboodControlBot:
             log("CHANNEL_ERR", f"فشل النشر في القناة: {res}")
 
     async def daily_midnight_stats_scheduler(self):
-        """جدولة النشر التلقائي للإحصائيات اليومية عند منتصف الليل (00:00 UTC+3)"""
         while True:
             await asyncio.sleep(20)
             now_dt = datetime.now(tz=TZ_UTC3)
@@ -853,9 +849,9 @@ class AboodControlBot:
         )
 
     # ==========================================
-    # التنفيذ الفوري، التدبيل المزدوج، ورسائل القناة
+    # التنفيذ الفوري، التدبيل المزدوج، والتقييم بسعر الصفقة الفعلي
     # ==========================================
-    async def open_trade(self, asset: str, direction: str, g_idx: int, p_idx: int, trade_minute: int):
+    async def open_trade(self, asset: str, direction: str, g_idx: int, p_idx: int, trade_minute: int, is_draw_retry: bool = False):
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
@@ -872,6 +868,8 @@ class AboodControlBot:
         self.global_step_index = g_idx
         self.pair_step_index = p_idx
         self.active_trade_minute = trade_minute
+        # وقت إغلاق مبدئي من لحظة فتح الصفقة (ويُحدّث فورًا بالوقت الدقيق من successopenOrder)
+        self.active_trade_close_ts = self.get_server_now() + TRADE_DURATION
         self.trade_entry_price = self.latest_prices.get(asset)
         self.mode = "IN_TRADE"
 
@@ -889,38 +887,47 @@ class AboodControlBot:
 
         sig_sym = self.format_signal_symbol(asset)
         dir_text = "🟢 CALL UP 📈" if direction == "call" else "🔴 PUT DOWN 📉"
+        tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else ""
         log(
             "TRADE_EXEC",
-            f"⚡ تنفيذ | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
-            f"[عام {g_idx + 1}/{self.global_steps} | زوج {p_idx + 1}/{self.pair_steps}]"
+            f"⚡ تنفيذ{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
+            f"سعر الدخول المبدئي: {self.trade_entry_price} | [عام {g_idx + 1}/{self.global_steps} | زوج {p_idx + 1}/{self.pair_steps}]"
         )
 
-        if p_idx == 0:
+        if p_idx == 0 and not is_draw_retry:
             confirm_msg = (
                 f"🚀 <b>تم تأكيد الدخول في الصفقة ✅</b>\n"
                 f"🏛 <code>{sig_sym}</code> | {dir_text}"
             )
             asyncio.create_task(self.send_channel(confirm_msg))
 
-    def evaluate_active_trade_candle(self, asset: str, trade_minute: int, direction: str) -> tuple[bool, str]:
-        candle = self.candles.get(asset, {}).get(trade_minute)
-        if candle is not None:
-            c_color = candle_color(candle["open"], candle["close"])
-            if direction == "put":
-                return (c_color == "RED"), c_color
-            else:
-                return (c_color == "GREEN"), c_color
-
+    def evaluate_active_trade_result(self, asset: str, direction: str) -> str:
+        """
+        تقييم الصفقة مقارنة بسعر فتح الصفقة الفعلي (openPrice) وليس بافتتاح الشمعة.
+        يرجع: "WIN" | "LOSS" | "DRAW"
+        """
         current_price = self.latest_prices.get(asset)
-        if current_price is not None and self.trade_entry_price is not None:
-            if direction == "put":
-                is_win = current_price < self.trade_entry_price
-                return is_win, ("RED" if is_win else "GREEN")
-            else:
-                is_win = current_price > self.trade_entry_price
-                return is_win, ("GREEN" if is_win else "RED")
+        entry_price = self.trade_entry_price
 
-        return False, "UNKNOWN"
+        if current_price is not None and entry_price is not None:
+            if current_price == entry_price:
+                return "DRAW"
+            if direction == "put":
+                return "WIN" if current_price < entry_price else "LOSS"
+            else:
+                return "WIN" if current_price > entry_price else "LOSS"
+
+        # احتياطي فقط في حال لم يتوفر السعر الحي
+        candle = self.candles.get(asset, {}).get(self.active_trade_minute)
+        if candle is not None:
+            if candle["close"] == candle["open"]:
+                return "DRAW"
+            if direction == "put":
+                return "WIN" if candle["close"] < candle["open"] else "LOSS"
+            else:
+                return "WIN" if candle["close"] > candle["open"] else "LOSS"
+
+        return "LOSS"
 
     async def precision_entry_watcher(self):
         while True:
@@ -930,7 +937,7 @@ class AboodControlBot:
 
             server_now = self.get_server_now()
 
-            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية
+            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية للدخول الأساسي
             if self.mode == "LOCKED" and self.locked_target_minute:
                 candle_close_ts = self.locked_target_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = candle_close_ts - server_now
@@ -996,10 +1003,9 @@ class AboodControlBot:
                         ))
                         self.switch_pair_keep_global("أغلقت خضراء عكس الشرط")
 
-            # 2) فحص الصفقة المفتوحة في آخر أجزاء من الثانية
-            elif self.mode == "IN_TRADE" and self.active_trade_minute:
-                trade_close_ts = self.active_trade_minute + 60.0 + SERVER_CLOCK_OFFSET
-                remaining = trade_close_ts - server_now
+            # 2) فحص الصفقة المفتوحة بناءً على وقت إغلاق الصفقة الفعلي وسعر دخولها الفعلي
+            elif self.mode == "IN_TRADE" and self.active_trade_close_ts:
+                remaining = self.active_trade_close_ts - server_now
 
                 if remaining > 2.0:
                     await asyncio.sleep(0.05)
@@ -1011,18 +1017,20 @@ class AboodControlBot:
                 asset = self.locked_pair
                 sig_sym = self.format_signal_symbol(asset)
                 direction = self.locked_direction
-                is_win, candle_col = self.evaluate_active_trade_candle(asset, self.active_trade_minute, direction)
+                result = self.evaluate_active_trade_result(asset, direction)
 
                 attempt_num = self.global_step_index + 1
                 sup_num = to_superscript(attempt_num)
+                curr_p = self.latest_prices.get(asset)
 
                 log(
                     "TRADE_CHECK",
                     f"⏱ فحص الصفقة قبل الإغلاق بـ {max(0.0, remaining):.3f}ث | {asset} | "
-                    f"{'WIN ✅' if is_win else 'عاكسة 🔻'} [عام {attempt_num}/{self.global_steps} | زوج {self.pair_step_index + 1}/{self.pair_steps}]"
+                    f"دخول: {self.trade_entry_price} vs حالي: {curr_p} => {result} "
+                    f"[عام {attempt_num}/{self.global_steps} | زوج {self.pair_step_index + 1}/{self.pair_steps}]"
                 )
 
-                if is_win:
+                if result == "WIN":
                     self.record_trade_outcome(sig_sym, is_win=True, attempt_num=attempt_num)
                     win_msg = (
                         f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
@@ -1034,9 +1042,24 @@ class AboodControlBot:
                     self.full_reset_to_scanning(f"صفقة رابحة WIN{attempt_num}")
                     continue
 
+                next_minute = (self.active_trade_minute or int(server_now // 60) * 60) + 60
+
+                # حالة التعادل (DRAW): إعادة الدخول بنفس المبلغ بدون تدبيل
+                if result == "DRAW":
+                    log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ دون تدبيل.")
+                    await self.open_trade(
+                        asset,
+                        direction,
+                        g_idx=self.global_step_index,
+                        p_idx=self.pair_step_index,
+                        trade_minute=next_minute,
+                        is_draw_retry=True
+                    )
+                    continue
+
+                # حالة الخسارة (LOSS): تطبيق التدبيل المزدوج
                 next_g_idx = self.global_step_index + 1
                 next_p_idx = self.pair_step_index + 1
-                next_minute = self.active_trade_minute + 60
 
                 if next_g_idx >= self.global_steps:
                     self.record_trade_outcome(sig_sym, is_win=False, attempt_num=attempt_num)
@@ -1147,7 +1170,19 @@ class AboodControlBot:
             return
 
         if event_name == "successopenOrder" and isinstance(data, dict):
-            log("ORDER_OK", f"تأكيد السيرفر للصفقة | ID: {data.get('id')} | المبلغ: ${data.get('amount')}")
+            # التقاط سعر فتح الصفقة الفعلي ووقت إغلاقها الفعلي من السيرفر مباشرة
+            if data.get("openPrice") is not None:
+                self.trade_entry_price = float(data["openPrice"])
+            if data.get("closeTimestamp") is not None:
+                self.active_trade_close_ts = normalize_ts(data["closeTimestamp"])
+            elif data.get("openTimestamp") is not None:
+                self.active_trade_close_ts = normalize_ts(data["openTimestamp"]) + TRADE_DURATION
+
+            log(
+                "ORDER_OK",
+                f"تأكيد السيرفر | ID: {data.get('id')} | المبلغ: ${data.get('amount')} | "
+                f"سعر الفتح الفعلي: {self.trade_entry_price}"
+            )
             return
 
         if event_name == "updateStream":
