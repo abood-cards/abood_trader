@@ -19,12 +19,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تل�
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
-# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية
-DEFAULT_LEAD_SECONDS = 0.10
-# تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة (ارفع الرقم لتأخير التدبيلة أكثر، وقلّله لتقديمها)
-MARTINGALE_OFFSET = 0.05
+# المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
+DEFAULT_LEAD_SECONDS = 0.1
+
 # تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
 SERVER_CLOCK_OFFSET = 0.75
+
+# تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة بدقة ومنع تقدمها ثانية كاملة
+MARTINGALE_OFFSET = 0.05
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
@@ -98,7 +100,7 @@ def make_progress_bar(count: int, total: int, length: int = 10) -> str:
 
 class AboodControlBot:
     def __init__(self):
-        # الإعدادات القابلة للتحكم من تليجرام
+        # الإعدادات الأساسية القابلة للتحكم من تليجرام
         self.is_running = False
         self.base_amount = 10.0
         self.global_steps = 6
@@ -106,6 +108,18 @@ class AboodControlBot:
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
         self.auth_frame = DEFAULT_AUTH_FRAME
+
+        # 1) إعدادات وضع التعزيز بعد خسارة التدبيل العام (متوقف افتراضيًا)
+        self.boost_enabled = False
+        self.boost_increment = 10.0          # مقدار الزيادة على المبلغ الأساسي بعد الخسارة
+        self.effective_base_amount = 10.0    # المبلغ الأساسي الفعلي العامل حاليًا
+        self.in_boost_recovery = False       # هل البوت حاليًا في مرحلة تعويض خسارة؟
+        self.recovery_balance = 0.0          # صافي رصيد التعويض (سالب = خسارة متبقية للتعويض)
+        self.current_cycle_spent = 0.0       # إجمالي ما أُنفق في الدورة الحالية
+
+        # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول (متوقف افتراضيًا)
+        self.continuation_enabled = False
+        self.is_continuation_trade = False   # علامة لتمييز الصفقة العكسية الناتجة عن مواصلة النموذج
 
         # نطاق المسح
         self.scan_scope = "CURRENCIES"
@@ -143,12 +157,19 @@ class AboodControlBot:
         self.global_step_index = 0
         self.pair_step_index = 0
         self.active_trade_minute = None
-        self.active_trade_close_ts = None   # وقت إغلاق الصفقة الفعلي بناءً على لحظة فتحها
-        self.trade_entry_price = None       # سعر فتح الصفقة الفعلي من السيرفر
+        self.active_trade_close_ts = None
+        self.trade_entry_price = None
 
         # سجل الإحصائيات اليومية (Daily Results)
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         self.daily_records = []
+
+    def reset_boost_state(self):
+        """إعادة ضبط حالة التعزيز والعودة للمبلغ الأساسي الأصلي"""
+        self.in_boost_recovery = False
+        self.recovery_balance = 0.0
+        self.current_cycle_spent = 0.0
+        self.effective_base_amount = self.base_amount
 
     def record_trade_outcome(self, pair_name: str, is_win: bool, attempt_num: int):
         today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
@@ -298,9 +319,10 @@ class AboodControlBot:
         return symbol.replace("_otc", "-OTC").replace("#", "")
 
     def get_trade_ladder(self) -> list[float]:
+        active_base = self.effective_base_amount if self.boost_enabled else self.base_amount
         ladder = []
         for i in range(self.global_steps):
-            val = self.base_amount * (2 ** i)
+            val = active_base * (2 ** i)
             ladder.append(int(val) if val.is_integer() else round(val, 2))
         return ladder
 
@@ -322,6 +344,7 @@ class AboodControlBot:
         self.active_trade_minute = None
         self.active_trade_close_ts = None
         self.trade_entry_price = None
+        self.is_continuation_trade = False
 
     def full_reset_to_scanning(self, reason: str):
         log("MODE", f"إعادة ضبط كاملة والعودة للمسح ({reason})")
@@ -334,6 +357,7 @@ class AboodControlBot:
         self.active_trade_minute = None
         self.active_trade_close_ts = None
         self.trade_entry_price = None
+        self.is_continuation_trade = False
 
     # ==========================================
     # واجهة التحكم (خاص بالأدمن) + الإرسال للقناة
@@ -344,6 +368,17 @@ class AboodControlBot:
             if self.is_running
             else {"text": "▶️ بدء التداول", "callback_data": "cmd_start"}
         )
+        boost_btn = (
+            {"text": "🛡️ التعزيز: مفعّل 🟢", "callback_data": "toggle_boost"}
+            if self.boost_enabled
+            else {"text": "🛡️ التعزيز: متوقف 🔴", "callback_data": "toggle_boost"}
+        )
+        cont_btn = (
+            {"text": "🔄 مواصلة النموذج: مفعّل 🟢", "callback_data": "toggle_cont"}
+            if self.continuation_enabled
+            else {"text": "🔄 مواصلة النموذج: متوقف 🔴", "callback_data": "toggle_cont"}
+        )
+
         return {
             "inline_keyboard": [
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
@@ -355,6 +390,13 @@ class AboodControlBot:
                 [
                     {"text": f"🌐 التدبيل العام ({self.global_steps})", "callback_data": "set_global_steps"},
                     {"text": f"🏛 تدبيل الزوج ({self.pair_steps})", "callback_data": "set_pair_steps"}
+                ],
+                [
+                    boost_btn,
+                    {"text": f"➕ زيادة التعزيز (+${self.boost_increment:g})", "callback_data": "set_boost_inc"}
+                ],
+                [
+                    cont_btn
                 ],
                 [
                     {"text": f"⏱ التقديم ({self.entry_lead_seconds}ث)", "callback_data": "set_lead"},
@@ -397,6 +439,18 @@ class AboodControlBot:
         wins_today = sum(1 for r in self.daily_records if r["result"] == "WIN")
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
 
+        # تفاصيل وضع التعزيز
+        if self.boost_enabled:
+            if self.in_boost_recovery:
+                deficit = abs(round(self.recovery_balance, 2))
+                boost_status = f"🟢 مفعّل (الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | للتعويض: <code>${deficit}</code>)"
+            else:
+                boost_status = f"🟢 مفعّل (الزيادة عند الخسارة: <code>+${self.boost_increment:g}</code>)"
+        else:
+            boost_status = "🔴 متوقف"
+
+        cont_status = "🟢 مفعّل (عكس الصفقة بعد WIN¹)" if self.continuation_enabled else "🔴 متوقف"
+
         mode_ar = {
             "SCANNING": f"🔍 يبحث عن فرصة (الدخول القادم: ${current_next_amt})",
             "LOCKED": f"🎯 مثبّت على {self.format_signal_symbol(self.locked_pair or '')} (الدخول: ${current_next_amt})",
@@ -420,6 +474,8 @@ class AboodControlBot:
             f"💵 <b>المبلغ الأساسي:</b> <code>${self.base_amount:g}</code>\n"
             f"🌐 <b>التدبيل العام ({self.global_steps}):</b> <code>{ladder_str}</code>\n"
             f"🏛 <b>تدبيل الزوج الواحد:</b> <code>{self.pair_steps} محاولات كحد أقصى</code>\n"
+            f"🛡️ <b>وضع التعزيز:</b> {boost_status}\n"
+            f"🔄 <b>مواصلة النموذج:</b> {cont_status}\n"
             f"⏱ <b>الفحص والدخول قبل الإغلاق:</b> <code>{self.entry_lead_seconds} ثانية</code>\n"
             f"📢 <b>قناة الإشارات:</b> <code>{CHANNEL_ID}</code>"
         )
@@ -512,6 +568,14 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "toggle_boost":
+                            self.boost_enabled = not self.boost_enabled
+                            if not self.boost_enabled:
+                                self.reset_boost_state()
+                            log("BOOST", f"حالة وضع التعزيز: {'مفعّل 🟢' if self.boost_enabled else 'متوقف 🔴'}")
+                        elif data == "toggle_cont":
+                            self.continuation_enabled = not self.continuation_enabled
+                            log("CONT", f"حالة مواصلة النموذج: {'مفعّل 🟢' if self.continuation_enabled else 'متوقف 🔴'}")
                         elif data == "stats_preview":
                             await self.send_admin(self.format_daily_stats_report())
                             continue
@@ -538,6 +602,13 @@ class AboodControlBot:
                             self.awaiting_input = "BASE_AMOUNT"
                             await self.send_admin("💵 أرسل الآن <b>المبلغ الأساسي</b> للصفقة (مثال: <code>10</code>):")
                             continue
+                        elif data == "set_boost_inc":
+                            self.awaiting_input = "BOOST_INC"
+                            await self.send_admin(
+                                "🛡️ أرسل الآن <b>مقدار الزيادة في التعزيز</b> التي تُضاف على المبلغ الأساسي بعد الخسارة "
+                                "(مثال: <code>10</code> ليصبح الأساسي 20$ ثم 30$ حتى تعويض الخسارة):"
+                            )
+                            continue
                         elif data == "set_global_steps":
                             self.awaiting_input = "GLOBAL_STEPS"
                             await self.send_admin("🌐 أرسل الآن <b>عدد التدبيلات العام</b> الإجمالي (مثال: <code>6</code>):")
@@ -552,7 +623,7 @@ class AboodControlBot:
                             continue
                         elif data == "set_lead":
                             self.awaiting_input = "LEAD_TIME"
-                            await self.send_admin("⏱ أرسل الآن <b>الفحص والدخول قبل الإغلاق بأجزاء الثانية</b> (مثال: <code>0.25</code> أو <code>0.15</code>):")
+                            await self.send_admin("⏱ أرسل الآن <b>الفحص والدخول قبل الإغلاق بأجزاء الثانية</b> (مثال: <code>0.1</code>):")
                             continue
                         elif data == "set_auth":
                             self.awaiting_input = "AUTH"
@@ -597,15 +668,38 @@ class AboodControlBot:
                             await self.send_admin(self.format_daily_stats_report())
                             continue
 
+                        if text in ("/reset_boost", "تصفير التعزيز"):
+                            self.reset_boost_state()
+                            await self.send_admin(
+                                f"✅ تم تصفير التعزيز وإعادة المبلغ الأساسي إلى <b>${self.base_amount:g}</b>.",
+                                self.build_main_keyboard()
+                            )
+                            continue
+
                         if self.awaiting_input == "BASE_AMOUNT":
                             try:
                                 val = float(text)
                                 if val >= 1:
                                     self.base_amount = val
+                                    if not self.in_boost_recovery:
+                                        self.effective_base_amount = val
                                     self.awaiting_input = None
                                     await self.send_admin(
                                         f"✅ تم ضبط المبلغ الأساسي إلى <b>${val:g}</b>.\n"
                                         f"🌐 السلم: <code>{' ⬅️ '.join(f'${x}' for x in self.get_trade_ladder())}</code>",
+                                        self.build_main_keyboard()
+                                    )
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>10</code>):")
+
+                        elif self.awaiting_input == "BOOST_INC":
+                            try:
+                                inc = float(text)
+                                if inc >= 1:
+                                    self.boost_increment = inc
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط زيادة التعزيز إلى <b>+${inc:g}</b> بعد خسارة التدبيل العام.",
                                         self.build_main_keyboard()
                                     )
                             except ValueError:
@@ -668,7 +762,7 @@ class AboodControlBot:
                                 else:
                                     await self.send_admin("⚠️ أدخل قيمة بين -1.0 و 3.0 ثانية:")
                             except ValueError:
-                                await self.send_admin("⚠️ أرسل رقمًا عشريًا (مثال: <code>0.25</code>):")
+                                await self.send_admin("⚠️ أرسل رقمًا عشريًا (مثال: <code>0.1</code>):")
 
                         elif self.awaiting_input == "AUTH":
                             if text.startswith('42["auth",'):
@@ -850,9 +944,18 @@ class AboodControlBot:
         )
 
     # ==========================================
-    # التنفيذ الفوري، التدبيل المزدوج، والتقييم بسعر الصفقة الفعلي
+    # التنفيذ الفوري، التدبيل، التعزيز، ومواصلة النموذج
     # ==========================================
-    async def open_trade(self, asset: str, direction: str, g_idx: int, p_idx: int, trade_minute: int, is_draw_retry: bool = False):
+    async def open_trade(
+        self,
+        asset: str,
+        direction: str,
+        g_idx: int,
+        p_idx: int,
+        trade_minute: int,
+        is_draw_retry: bool = False,
+        is_cont_entry: bool = False
+    ):
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
@@ -869,10 +972,14 @@ class AboodControlBot:
         self.global_step_index = g_idx
         self.pair_step_index = p_idx
         self.active_trade_minute = trade_minute
-        # وقت إغلاق مبدئي من لحظة فتح الصفقة (ويُحدّث فورًا بالوقت الدقيق من successopenOrder)
         self.active_trade_close_ts = self.get_server_now() + TRADE_DURATION + MARTINGALE_OFFSET
         self.trade_entry_price = self.latest_prices.get(asset)
         self.mode = "IN_TRADE"
+
+        # تحديث محاسبة التعزيز والدورة
+        self.current_cycle_spent += amount
+        if self.boost_enabled and self.in_boost_recovery:
+            self.recovery_balance -= amount
 
         order_payload = {
             "asset": asset,
@@ -888,14 +995,24 @@ class AboodControlBot:
 
         sig_sym = self.format_signal_symbol(asset)
         dir_text = "🟢 CALL UP 📈" if direction == "call" else "🔴 PUT DOWN 📉"
-        tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else ""
+        tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else (" (مواصلة النموذج 🔄)" if is_cont_entry else "")
         log(
             "TRADE_EXEC",
             f"⚡ تنفيذ{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
-            f"سعر الدخول المبدئي: {self.trade_entry_price} | [عام {g_idx + 1}/{self.global_steps} | زوج {p_idx + 1}/{self.pair_steps}]"
+            f"سعر الفتح: {self.trade_entry_price} | [عام {g_idx + 1}/{self.global_steps} | زوج {p_idx + 1}/{self.pair_steps}]"
         )
 
-        if p_idx == 0 and not is_draw_retry:
+        if is_cont_entry:
+            cont_msg = (
+                f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
+                f"┃ 🔄 <b>مواصلة النموذج (دخول عكسي)</b>\n"
+                f"┃ 🏛 <code>{sig_sym}</code>\n"
+                f"┃ ⏱ Expiry  M1\n"
+                f"┃ {dir_text}\n"
+                f"╰━━━━━━━━━━━━━━━╯"
+            )
+            asyncio.create_task(self.send_channel(cont_msg))
+        elif p_idx == 0 and not is_draw_retry:
             confirm_msg = (
                 f"🚀 <b>تم تأكيد الدخول في الصفقة ✅</b>\n"
                 f"🏛 <code>{sig_sym}</code> | {dir_text}"
@@ -903,10 +1020,6 @@ class AboodControlBot:
             asyncio.create_task(self.send_channel(confirm_msg))
 
     def evaluate_active_trade_result(self, asset: str, direction: str) -> str:
-        """
-        تقييم الصفقة مقارنة بسعر فتح الصفقة الفعلي (openPrice) وليس بافتتاح الشمعة.
-        يرجع: "WIN" | "LOSS" | "DRAW"
-        """
         current_price = self.latest_prices.get(asset)
         entry_price = self.trade_entry_price
 
@@ -918,7 +1031,6 @@ class AboodControlBot:
             else:
                 return "WIN" if current_price > entry_price else "LOSS"
 
-        # احتياطي فقط في حال لم يتوفر السعر الحي
         candle = self.candles.get(asset, {}).get(self.active_trade_minute)
         if candle is not None:
             if candle["close"] == candle["open"]:
@@ -947,7 +1059,7 @@ class AboodControlBot:
                     await asyncio.sleep(0.05)
                     continue
                 elif remaining > self.entry_lead_seconds:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.001)
                     continue
 
                 asset = self.locked_pair
@@ -1012,7 +1124,7 @@ class AboodControlBot:
                     await asyncio.sleep(0.05)
                     continue
                 elif remaining > self.entry_lead_seconds:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.001)
                     continue
 
                 asset = self.locked_pair
@@ -1020,9 +1132,12 @@ class AboodControlBot:
                 direction = self.locked_direction
                 result = self.evaluate_active_trade_result(asset, direction)
 
+                ladder = self.get_trade_ladder()
+                won_amount = ladder[self.global_step_index]
                 attempt_num = self.global_step_index + 1
                 sup_num = to_superscript(attempt_num)
                 curr_p = self.latest_prices.get(asset)
+                next_minute = (self.active_trade_minute or int(server_now // 60) * 60) + 60
 
                 log(
                     "TRADE_CHECK",
@@ -1031,6 +1146,7 @@ class AboodControlBot:
                     f"[عام {attempt_num}/{self.global_steps} | زوج {self.pair_step_index + 1}/{self.pair_steps}]"
                 )
 
+                # ==================== أ) حالة الربح (WIN) ====================
                 if result == "WIN":
                     self.record_trade_outcome(sig_sym, is_win=True, attempt_num=attempt_num)
                     win_msg = (
@@ -1040,14 +1156,55 @@ class AboodControlBot:
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
                     asyncio.create_task(self.send_channel(win_msg))
+
+                    # تحديث محاسبة التعزيز عند الربح
+                    self.current_cycle_spent = 0.0
+                    if self.boost_enabled and self.in_boost_recovery:
+                        payout_pct = self.payouts.get(asset, self.min_payout)
+                        self.recovery_balance += won_amount * (1.0 + payout_pct / 100.0)
+                        if self.recovery_balance >= 0:
+                            log("BOOST_DONE", f"🎉 تم تعويض خسارة التعزيز بالكامل! العودة للمبلغ الأساسي ${self.base_amount:g}")
+                            asyncio.create_task(self.send_admin(
+                                f"🎉 <b>تم تعويض الخسارة بالكامل في وضع التعزيز!</b>\n"
+                                f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                            ))
+                            self.reset_boost_state()
+                        else:
+                            log("BOOST_PROG", f"🛡️ تقدم التعزيز: المتبقي للتعويض ${abs(self.recovery_balance):.2f} (الأساسي مستمر عند ${self.effective_base_amount:g})")
+
+                    # التحقق من وضع "مواصلة النموذج":
+                    # إذا كان مفعّلاً + ربحت من أول دخول (attempt_num == 1) + ليست صفقة مواصلة سابقة
+                    if self.continuation_enabled and attempt_num == 1 and not self.is_continuation_trade:
+                        eligible, _ = self.is_pair_eligible(asset)
+                        if eligible:
+                            opp_dir = "call" if direction == "put" else "put"
+                            self.is_continuation_trade = True
+                            self.locked_direction = opp_dir
+                            self.global_step_index = 0
+                            self.pair_step_index = 0
+                            log("CONT_EXEC", f"🔄 تفعيل مواصلة النموذج على {sig_sym} — دخول عكسي ({opp_dir.upper()})")
+                            await self.open_trade(
+                                asset,
+                                opp_dir,
+                                g_idx=0,
+                                p_idx=0,
+                                trade_minute=next_minute,
+                                is_cont_entry=True
+                            )
+                            continue
+
+                    # في الحالات العادية أو بعد نجاح صفقة مواصلة النموذج -> الخروج للبحث عن عملة أخرى
                     self.full_reset_to_scanning(f"صفقة رابحة WIN{attempt_num}")
                     continue
 
-                next_minute = (self.active_trade_minute or int(server_now // 60) * 60) + 60
-
-                # حالة التعادل (DRAW): إعادة الدخول بنفس المبلغ بدون تدبيل
+                # ==================== ب) حالة التعادل (DRAW) ====================
                 if result == "DRAW":
-                    log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ دون تدبيل.")
+                    # استرداد مبلغ التعادل في المحاسبة وإعادة الدخول بنفس المبلغ بدون تدبيل
+                    self.current_cycle_spent -= won_amount
+                    if self.boost_enabled and self.in_boost_recovery:
+                        self.recovery_balance += won_amount
+
+                    log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ (${won_amount}) دون تدبيل.")
                     await self.open_trade(
                         asset,
                         direction,
@@ -1058,10 +1215,11 @@ class AboodControlBot:
                     )
                     continue
 
-                # حالة الخسارة (LOSS): تطبيق التدبيل المزدوج
+                # ==================== ج) حالة الخسارة (LOSS) ====================
                 next_g_idx = self.global_step_index + 1
                 next_p_idx = self.pair_step_index + 1
 
+                # هل انتهت جميع خطوات التدبيل العام بخسارة؟
                 if next_g_idx >= self.global_steps:
                     self.record_trade_outcome(sig_sym, is_win=False, attempt_num=attempt_num)
                     loss_msg = (
@@ -1071,7 +1229,29 @@ class AboodControlBot:
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
                     asyncio.create_task(self.send_channel(loss_msg))
+
+                    # تفعيل أو تصعيد وضع التعزيز إذا كان مفعّلاً من لوحة التحكم
+                    if self.boost_enabled:
+                        if not self.in_boost_recovery:
+                            self.in_boost_recovery = True
+                            self.recovery_balance = -self.current_cycle_spent
+                        self.current_cycle_spent = 0.0
+                        self.effective_base_amount += self.boost_increment
+                        log(
+                            "BOOST_UP",
+                            f"🛡️ تعزيز بعد خسارة الدورة! الأساسي الجديد: ${self.effective_base_amount:g} | "
+                            f"إجمالي المطلوب تعويضه: ${abs(self.recovery_balance):.2f}"
+                        )
+                        asyncio.create_task(self.send_admin(
+                            f"🛡️ <b>تم تفعيل/تصعيد التعزيز بعد الخسارة!</b>\n"
+                            f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
+                            f"📉 إجمالي الخسارة المطلوب تعويضها: <code>${abs(self.recovery_balance):.2f}</code>"
+                        ))
+                    else:
+                        self.current_cycle_spent = 0.0
+
                     next_g_idx = 0
+                    self.is_continuation_trade = False
 
                     if next_p_idx < self.pair_steps:
                         await self.open_trade(asset, direction, g_idx=next_g_idx, p_idx=next_p_idx, trade_minute=next_minute)
@@ -1120,6 +1300,7 @@ class AboodControlBot:
                 self.locked_direction = "put"
                 self.locked_target_minute = m_open
                 self.pair_step_index = 0
+                self.is_continuation_trade = False
                 log("LOCK", f"🎯 رصد نموذج بيع على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
 
                 signal_msg = (
@@ -1141,6 +1322,7 @@ class AboodControlBot:
                 self.locked_direction = "call"
                 self.locked_target_minute = m_open
                 self.pair_step_index = 0
+                self.is_continuation_trade = False
                 log("LOCK", f"🎯 رصد نموذج شراء على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
 
                 signal_msg = (
