@@ -26,12 +26,14 @@ DEFAULT_LEAD_SECONDS = 0.1
 SERVER_CLOCK_OFFSET = 0.75
 
 # تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة بدقة ومنع تقدمها ثانية كاملة
-MARTINGALE_OFFSET = 0.05
+MARTINGALE_OFFSET = 0.15
 
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
     '42["auth",{"session":"et97hpjdhses78itun3rk2peld","isDemo":1,"uid":142271281,"platform":2,"isFastHistory":true,"isOptimized":true}]'
 )
+
+ACCOUNTS_FILE = "accounts.json"
 
 FALLBACK_CURRENCIES = [
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
@@ -98,6 +100,29 @@ def make_progress_bar(count: int, total: int, length: int = 10) -> str:
     return "█" * filled + "░" * (length - filled)
 
 
+def parse_auth_frame(frame: str) -> dict | None:
+    """استخراج بيانات الجلسة (uid, isDemo, session) من إطار 42["auth",...]"""
+    try:
+        clean = frame.strip()
+        if not clean.startswith('42["auth",'):
+            return None
+        parsed = json.loads(clean[2:])
+        if isinstance(parsed, list) and len(parsed) >= 2 and isinstance(parsed[1], dict):
+            return parsed[1]
+    except Exception:
+        pass
+    return None
+
+
+def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
+    """تحديث وضع الحساب (تجريبي 1 أو حقيقي 0) داخل كود الجلسة"""
+    payload = parse_auth_frame(frame)
+    if payload is None:
+        return frame
+    payload["isDemo"] = 1 if is_demo else 0
+    return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
+
+
 class AboodControlBot:
     def __init__(self):
         # الإعدادات الأساسية القابلة للتحكم من تليجرام
@@ -107,19 +132,26 @@ class AboodControlBot:
         self.pair_steps = 4
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
+
+        # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
+        self.accounts = []
+        self.active_account_idx = 0
+        self.is_demo_mode = True
         self.auth_frame = DEFAULT_AUTH_FRAME
+        self.temp_new_acc_name = ""
+        self._load_accounts_storage()
 
         # 1) إعدادات وضع التعزيز بعد خسارة التدبيل العام (متوقف افتراضيًا)
         self.boost_enabled = False
-        self.boost_increment = 10.0          # مقدار الزيادة على المبلغ الأساسي بعد الخسارة
-        self.effective_base_amount = 10.0    # المبلغ الأساسي الفعلي العامل حاليًا
-        self.in_boost_recovery = False       # هل البوت حاليًا في مرحلة تعويض خسارة؟
-        self.recovery_balance = 0.0          # صافي رصيد التعويض (سالب = خسارة متبقية للتعويض)
-        self.current_cycle_spent = 0.0       # إجمالي ما أُنفق في الدورة الحالية
+        self.boost_increment = 10.0
+        self.effective_base_amount = 10.0
+        self.in_boost_recovery = False
+        self.recovery_balance = 0.0
+        self.current_cycle_spent = 0.0
 
         # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول (متوقف افتراضيًا)
         self.continuation_enabled = False
-        self.is_continuation_trade = False   # علامة لتمييز الصفقة العكسية الناتجة عن مواصلة النموذج
+        self.is_continuation_trade = False
 
         # نطاق المسح
         self.scan_scope = "CURRENCIES"
@@ -145,8 +177,14 @@ class AboodControlBot:
         self.ws = None
         self.http_session = None
         self.req_index = 100
-        self.demo_balance = None
+        self.account_balance = None
         self.server_hour_shift = 0.0
+
+        # نظام ربط الردود على رسائل القناة لكل صفقة (Reply Threading)
+        self.channel_queue = asyncio.Queue()
+        self.signal_seq = 0
+        self.current_signal_uid = None
+        self.signal_msg_ids = {}  # signal_uid -> telegram message_id
 
         # حالات التداول
         self.mode = "SCANNING"
@@ -164,8 +202,61 @@ class AboodControlBot:
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         self.daily_records = []
 
+    # ==========================================
+    # إدارة الحسابات المتعددة والتخزين
+    # ==========================================
+    def _load_accounts_storage(self):
+        loaded = False
+        if os.path.exists(ACCOUNTS_FILE):
+            try:
+                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("accounts"):
+                    self.accounts = data["accounts"]
+                    self.active_account_idx = min(int(data.get("active_idx", 0)), len(self.accounts) - 1)
+                    self.is_demo_mode = bool(data.get("is_demo_mode", True))
+                    loaded = True
+            except Exception as e:
+                log("ACC_WARN", f"تعذر قراءة ملف الحسابات: {e}")
+
+        if not loaded or not self.accounts:
+            parsed = parse_auth_frame(DEFAULT_AUTH_FRAME) or {}
+            uid = str(parsed.get("uid", "142271281"))
+            self.is_demo_mode = bool(parsed.get("isDemo", 1) == 1)
+            self.accounts = [{
+                "name": "الحساب الافتراضي",
+                "uid": uid,
+                "auth_frame": DEFAULT_AUTH_FRAME
+            }]
+            self.active_account_idx = 0
+            self._save_accounts_storage()
+
+        self._sync_active_auth_frame()
+
+    def _save_accounts_storage(self):
+        try:
+            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "active_idx": self.active_account_idx,
+                    "is_demo_mode": self.is_demo_mode,
+                    "accounts": self.accounts
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log("ACC_WARN", f"تعذر حفظ ملف الحسابات: {e}")
+
+    def _sync_active_auth_frame(self):
+        if not self.accounts:
+            return
+        self.active_account_idx = max(0, min(self.active_account_idx, len(self.accounts) - 1))
+        raw_frame = self.accounts[self.active_account_idx]["auth_frame"]
+        self.auth_frame = build_auth_frame_with_mode(raw_frame, self.is_demo_mode)
+
+    def get_active_account(self) -> dict:
+        if not self.accounts:
+            return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame}
+        return self.accounts[self.active_account_idx]
+
     def reset_boost_state(self):
-        """إعادة ضبط حالة التعزيز والعودة للمبلغ الأساسي الأصلي"""
         self.in_boost_recovery = False
         self.recovery_balance = 0.0
         self.current_cycle_spent = 0.0
@@ -327,12 +418,24 @@ class AboodControlBot:
         return ladder
 
     def get_ws_url(self) -> str:
-        if '"isDemo":1' in self.auth_frame or '"isDemo": 1' in self.auth_frame:
+        if self.is_demo_mode:
             return "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
         return "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 
     def get_server_now(self) -> float:
         return time.time() + self.server_hour_shift
+
+    def enqueue_new_signal(self, text: str) -> int:
+        """إنشاء معرّف جديد للصفقة وجدولة رسالتها الرئيسية في القناة"""
+        self.signal_seq += 1
+        uid = self.signal_seq
+        self.current_signal_uid = uid
+        self.channel_queue.put_nowait(("NEW", uid, text))
+        return uid
+
+    def enqueue_signal_reply(self, signal_uid: int | None, text: str):
+        """جدولة ردّ مباشر (Reply) على رسالة الصفقة المحددة"""
+        self.channel_queue.put_nowait(("REPLY", signal_uid, text))
 
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
@@ -345,6 +448,7 @@ class AboodControlBot:
         self.active_trade_close_ts = None
         self.trade_entry_price = None
         self.is_continuation_trade = False
+        self.current_signal_uid = None
 
     def full_reset_to_scanning(self, reason: str):
         log("MODE", f"إعادة ضبط كاملة والعودة للمسح ({reason})")
@@ -358,15 +462,21 @@ class AboodControlBot:
         self.active_trade_close_ts = None
         self.trade_entry_price = None
         self.is_continuation_trade = False
+        self.current_signal_uid = None
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + الإرسال للقناة
+    # واجهة التحكم (خاص بالأدمن) + إدارة الحسابات
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
             {"text": "⏹ إيقاف التداول", "callback_data": "cmd_stop"}
             if self.is_running
             else {"text": "▶️ بدء التداول", "callback_data": "cmd_start"}
+        )
+        mode_btn = (
+            {"text": "🧪 الحساب: تجريبي (Demo)", "callback_data": "toggle_account_mode"}
+            if self.is_demo_mode
+            else {"text": "💵 الحساب: حقيقي (Live) 🔥", "callback_data": "toggle_account_mode"}
         )
         boost_btn = (
             {"text": "🛡️ التعزيز: مفعّل 🟢", "callback_data": "toggle_boost"}
@@ -382,6 +492,7 @@ class AboodControlBot:
         return {
             "inline_keyboard": [
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
+                [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
                 [{"text": f"🎯 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [
                     {"text": f"💵 الأساسي (${self.base_amount:g})", "callback_data": "set_amount"},
@@ -395,19 +506,47 @@ class AboodControlBot:
                     boost_btn,
                     {"text": f"➕ زيادة التعزيز (+${self.boost_increment:g})", "callback_data": "set_boost_inc"}
                 ],
-                [
-                    cont_btn
-                ],
+                [cont_btn],
                 [
                     {"text": f"⏱ التقديم ({self.entry_lead_seconds}ث)", "callback_data": "set_lead"},
-                    {"text": "🔑 تحديث الجلسة", "callback_data": "set_auth"}
+                    {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"}
                 ],
                 [
-                    {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"},
                     {"text": "📢 نشر الإحصائيات بالقناة", "callback_data": "stats_publish"}
                 ]
             ]
         }
+
+    def build_accounts_keyboard(self) -> dict:
+        rows = []
+        for idx, acc in enumerate(self.accounts):
+            prefix = "✅ " if idx == self.active_account_idx else "👤 "
+            rows.append([{
+                "text": f"{prefix}{acc['name']} ({acc['uid']})",
+                "callback_data": f"select_acc_{idx}"
+            }])
+
+        rows.append([
+            {"text": "➕ إضافة حساب جديد", "callback_data": "add_account_start"},
+            {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
+        ])
+        rows.append([
+            {"text": "🔑 تحديث جلسة الحساب الحالي", "callback_data": "set_auth"}
+        ])
+        rows.append([
+            {"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}
+        ])
+        return {"inline_keyboard": rows}
+
+    def build_delete_accounts_keyboard(self) -> dict:
+        rows = []
+        for idx, acc in enumerate(self.accounts):
+            rows.append([{
+                "text": f"🗑️ حذف: {acc['name']} ({acc['uid']})",
+                "callback_data": f"del_acc_{idx}"
+            }])
+        rows.append([{"text": "🔙 رجوع لإدارة الحسابات", "callback_data": "menu_accounts"}])
+        return {"inline_keyboard": rows}
 
     def build_scope_keyboard(self) -> dict:
         def mark(code: str, title: str) -> str:
@@ -430,7 +569,11 @@ class AboodControlBot:
         current_next_amt = ladder[min(self.global_step_index, len(ladder) - 1)]
         status_icon = "🟢 يعمل الآن" if self.is_running else "🔴 متوقف"
         conn_icon = "متصل مستقر ✅" if self.authenticated else "جاري الاتصال ⏳"
-        bal_str = f"${self.demo_balance}" if self.demo_balance is not None else "غير متاح"
+
+        acc = self.get_active_account()
+        acc_mode_str = "🧪 تجريبي (Demo)" if self.is_demo_mode else "💵 حقيقي (Live) 🔥"
+        bal_label = "رصيد الديمو" if self.is_demo_mode else "الرصيد الحقيقي"
+        bal_str = f"${self.account_balance}" if self.account_balance is not None else "جاري الجلب..."
 
         active_pairs = self.get_active_scan_pairs()
         eligible_count = sum(1 for p in active_pairs if self.payouts.get(p, 0) >= self.min_payout)
@@ -439,7 +582,6 @@ class AboodControlBot:
         wins_today = sum(1 for r in self.daily_records if r["result"] == "WIN")
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
 
-        # تفاصيل وضع التعزيز
         if self.boost_enabled:
             if self.in_boost_recovery:
                 deficit = abs(round(self.recovery_balance, 2))
@@ -464,8 +606,10 @@ class AboodControlBot:
             f"♟ <b>لوحة إدارة عبود تريدينج (24/7)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة:</b> {status_icon}\n"
+            f"👤 <b>الحساب النشط:</b> <b>{acc['name']}</b> (<code>{acc['uid']}</code>)\n"
+            f"🎛 <b>نوع الحساب:</b> {acc_mode_str}\n"
+            f"💰 <b>{bal_label}:</b> <code>{bal_str}</code>\n"
             f"🌐 <b>السيرفر:</b> {conn_icon}\n"
-            f"💰 <b>رصيد الديمو:</b> <code>{bal_str}</code>\n"
             f"📍 <b>النشاط:</b> {mode_ar}\n"
             f"📊 <b>إحصائيات اليوم:</b> <code>{wins_today}/{total_today}</code> ({rate_today:.1f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -476,7 +620,7 @@ class AboodControlBot:
             f"🏛 <b>تدبيل الزوج الواحد:</b> <code>{self.pair_steps} محاولات كحد أقصى</code>\n"
             f"🛡️ <b>وضع التعزيز:</b> {boost_status}\n"
             f"🔄 <b>مواصلة النموذج:</b> {cont_status}\n"
-            f"⏱ <b>الفحص والدخول قبل الإغلاق:</b> <code>{self.entry_lead_seconds} ثانية</code>\n"
+            f"⏱ <b>التقديم قبل الإغلاق:</b> <code>{self.entry_lead_seconds} ثانية</code>\n"
             f"📢 <b>قناة الإشارات:</b> <code>{CHANNEL_ID}</code>"
         )
 
@@ -505,21 +649,49 @@ class AboodControlBot:
             payload["reply_markup"] = reply_markup
         await self.tg_api("sendMessage", payload, req_timeout=15.0, retries=3)
 
-    async def send_channel(self, text: str):
+    async def send_channel(self, text: str, reply_to_message_id: int = None) -> int | None:
         if not CHANNEL_ID or "ضع_" in str(CHANNEL_ID):
             log("WARN", "لم يتم ضبط CHANNEL_ID بعد — تعذّر الإرسال للقناة.")
-            return
+            return None
         payload = {
             "chat_id": CHANNEL_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+
         res = await self.tg_api("sendMessage", payload, req_timeout=15.0, retries=3)
         if res and res.get("ok"):
-            log("CHANNEL", "تم نشر الرسالة في القناة بنجاح ✅")
+            msg_id = res.get("result", {}).get("message_id")
+            log("CHANNEL", f"تم نشر الرسالة في القناة بنجاح ✅ (msg_id={msg_id}, reply_to={reply_to_message_id})")
+            return msg_id
         else:
             log("CHANNEL_ERR", f"فشل النشر في القناة: {res}")
+            return None
+
+    async def channel_sender_worker(self):
+        """عامل متسلسل يضمن إرسال كل إشارة ثم ربط الردود (دخول / ربح / خسارة / إلغاء) بها بالترتيب الدقيق"""
+        while True:
+            kind, uid, text = await self.channel_queue.get()
+            try:
+                if kind == "NEW":
+                    msg_id = await self.send_channel(text, reply_to_message_id=None)
+                    if uid is not None and msg_id is not None:
+                        self.signal_msg_ids[uid] = msg_id
+                        # تنظيف المعرفات القديمة للاحتفاظ بآخر 100 إشارة فقط
+                        if len(self.signal_msg_ids) > 100:
+                            oldest_uid = min(self.signal_msg_ids.keys())
+                            del self.signal_msg_ids[oldest_uid]
+                elif kind == "REPLY":
+                    parent_msg_id = self.signal_msg_ids.get(uid) if uid is not None else None
+                    await self.send_channel(text, reply_to_message_id=parent_msg_id)
+            except Exception as e:
+                log("CH_WORKER_ERR", f"خطأ في طابور القناة: {e}")
+            finally:
+                self.channel_queue.task_done()
 
     async def daily_midnight_stats_scheduler(self):
         while True:
@@ -568,6 +740,127 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "toggle_account_mode":
+                            if self.is_demo_mode:
+                                # طلب تأكيد قبل التحويل للحساب الحقيقي للأمان
+                                acc = self.get_active_account()
+                                await self.tg_api("editMessageText", {
+                                    "chat_id": ADMIN_CHAT_ID,
+                                    "message_id": msg_id,
+                                    "text": (
+                                        f"⚠️ <b>تنبيه أمان — التحويل للحساب الحقيقي (Live)</b>\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"👤 <b>الحساب:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                        f"💵 <b>المبلغ الأساسي الحالي:</b> <code>${self.base_amount:g}</code>\n\n"
+                                        f"هل أنت متأكد من تفعيل التداول على <b>الحساب الحقيقي</b>؟"
+                                    ),
+                                    "parse_mode": "HTML",
+                                    "reply_markup": {
+                                        "inline_keyboard": [
+                                            [{"text": "🔥 نعم، تفعيل الحساب الحقيقي (Live)", "callback_data": "confirm_live_mode"}],
+                                            [{"text": "❌ إلغاء والبقاء على التجريبي", "callback_data": "cmd_status"}]
+                                        ]
+                                    }
+                                })
+                                continue
+                            else:
+                                # العودة الفورية للحساب التجريبي
+                                self.is_demo_mode = True
+                                self.account_balance = None
+                                self._sync_active_auth_frame()
+                                self._save_accounts_storage()
+                                self.full_reset_to_scanning("التحويل إلى الحساب التجريبي")
+                                log("ACC_MODE", "تم التحويل إلى الحساب التجريبي (Demo) 🧪")
+                                if self.ws:
+                                    await self.ws.close()
+                        elif data == "confirm_live_mode":
+                            self.is_demo_mode = False
+                            self.account_balance = None
+                            self._sync_active_auth_frame()
+                            self._save_accounts_storage()
+                            self.full_reset_to_scanning("التحويل إلى الحساب الحقيقي")
+                            log("ACC_MODE", "🔥 تم التحويل إلى الحساب الحقيقي (Live)")
+                            if self.ws:
+                                await self.ws.close()
+                        elif data == "menu_accounts":
+                            acc = self.get_active_account()
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": (
+                                    f"👤 <b>إدارة حسابات Pocket Option</b>\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n\n"
+                                    f"اختر حسابًا للتبديل إليه فورًا أو أضف حسابًا جديدًا:"
+                                ),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_accounts_keyboard()
+                            })
+                            continue
+                        elif data.startswith("select_acc_"):
+                            try:
+                                idx = int(data.replace("select_acc_", ""))
+                                if 0 <= idx < len(self.accounts):
+                                    self.active_account_idx = idx
+                                    self.account_balance = None
+                                    self._sync_active_auth_frame()
+                                    self._save_accounts_storage()
+                                    self.full_reset_to_scanning("تغيير الحساب النشط")
+                                    acc = self.get_active_account()
+                                    log("ACC_SWITCH", f"تم التبديل إلى الحساب: {acc['name']} ({acc['uid']})")
+                                    if self.ws:
+                                        await self.ws.close()
+                            except ValueError:
+                                pass
+                        elif data == "add_account_start":
+                            self.awaiting_input = "ADD_ACC_NAME"
+                            await self.send_admin(
+                                "👤 <b>إضافة حساب جديد — الخطوة 1 من 2:</b>\n"
+                                "أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code> أو <code>حساب VIP</code>):"
+                            )
+                            continue
+                        elif data == "menu_delete_account":
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": "🗑️ <b>اختر الحساب الذي تريد حذفه:</b>",
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_delete_accounts_keyboard()
+                            })
+                            continue
+                        elif data.startswith("del_acc_"):
+                            try:
+                                idx = int(data.replace("del_acc_", ""))
+                                if len(self.accounts) <= 1:
+                                    await self.send_admin("⚠️ لا يمكن حذف الحساب الوحيد المتبقي. أضف حسابًا آخر أولاً ثم احذف هذا الحساب.")
+                                elif 0 <= idx < len(self.accounts):
+                                    removed = self.accounts.pop(idx)
+                                    if self.active_account_idx >= len(self.accounts):
+                                        self.active_account_idx = 0
+                                    self.account_balance = None
+                                    self._sync_active_auth_frame()
+                                    self._save_accounts_storage()
+                                    self.full_reset_to_scanning("حذف حساب")
+                                    log("ACC_DEL", f"تم حذف الحساب: {removed['name']} ({removed['uid']})")
+                                    if self.ws:
+                                        await self.ws.close()
+                            except ValueError:
+                                pass
+                            acc = self.get_active_account()
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": (
+                                    f"👤 <b>إدارة حسابات Pocket Option</b>\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>"
+                                ),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_accounts_keyboard()
+                            })
+                            continue
                         elif data == "toggle_boost":
                             self.boost_enabled = not self.boost_enabled
                             if not self.boost_enabled:
@@ -606,7 +899,7 @@ class AboodControlBot:
                             self.awaiting_input = "BOOST_INC"
                             await self.send_admin(
                                 "🛡️ أرسل الآن <b>مقدار الزيادة في التعزيز</b> التي تُضاف على المبلغ الأساسي بعد الخسارة "
-                                "(مثال: <code>10</code> ليصبح الأساسي 20$ ثم 30$ حتى تعويض الخسارة):"
+                                "(مثال: <code>10</code>):"
                             )
                             continue
                         elif data == "set_global_steps":
@@ -627,7 +920,10 @@ class AboodControlBot:
                             continue
                         elif data == "set_auth":
                             self.awaiting_input = "AUTH"
-                            await self.send_admin('🔑 أرسل الآن إطار الجلسة الكامل للديمو (<code>42["auth",...]</code>):')
+                            acc = self.get_active_account()
+                            await self.send_admin(
+                                f'🔑 أرسل الآن كود الجلسة الجديد (<code>42["auth",...]</code>) للحساب <b>{acc["name"]}</b>:'
+                            )
                             continue
 
                         await self.tg_api("editMessageText", {
@@ -676,7 +972,42 @@ class AboodControlBot:
                             )
                             continue
 
-                        if self.awaiting_input == "BASE_AMOUNT":
+                        if self.awaiting_input == "ADD_ACC_NAME":
+                            self.temp_new_acc_name = text[:30]
+                            self.awaiting_input = "ADD_ACC_AUTH"
+                            await self.send_admin(
+                                f"🔑 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 2 من 2:</b>\n"
+                                f'أرسل الآن إطار الجلسة الكامل (<code>42["auth",...]</code>) وسيتم استخراج الآيدي وحفظ الحساب تلقائيًا:'
+                            )
+
+                        elif self.awaiting_input == "ADD_ACC_AUTH":
+                            parsed = parse_auth_frame(text)
+                            if parsed is not None:
+                                uid = str(parsed.get("uid", "Unknown"))
+                                new_acc = {
+                                    "name": self.temp_new_acc_name,
+                                    "uid": uid,
+                                    "auth_frame": text.strip()
+                                }
+                                self.accounts.append(new_acc)
+                                self.active_account_idx = len(self.accounts) - 1
+                                self.account_balance = None
+                                self._sync_active_auth_frame()
+                                self._save_accounts_storage()
+                                self.awaiting_input = None
+                                self.full_reset_to_scanning("إضافة وتفعيل حساب جديد")
+                                await self.send_admin(
+                                    f"✅ <b>تم حفظ وتفعيل الحساب بنجاح!</b>\n"
+                                    f"👤 <b>الاسم:</b> {new_acc['name']}\n"
+                                    f"🆔 <b>الآيدي (UID):</b> <code>{uid}</code>",
+                                    self.build_main_keyboard()
+                                )
+                                if self.ws:
+                                    await self.ws.close()
+                            else:
+                                await self.send_admin('⚠️ صيغة الجلسة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
+
+                        elif self.awaiting_input == "BASE_AMOUNT":
                             try:
                                 val = float(text)
                                 if val >= 1:
@@ -765,10 +1096,19 @@ class AboodControlBot:
                                 await self.send_admin("⚠️ أرسل رقمًا عشريًا (مثال: <code>0.1</code>):")
 
                         elif self.awaiting_input == "AUTH":
-                            if text.startswith('42["auth",'):
-                                self.auth_frame = text
+                            parsed = parse_auth_frame(text)
+                            if parsed is not None:
+                                uid = str(parsed.get("uid", self.get_active_account()["uid"]))
+                                self.accounts[self.active_account_idx]["auth_frame"] = text.strip()
+                                self.accounts[self.active_account_idx]["uid"] = uid
+                                self.account_balance = None
+                                self._sync_active_auth_frame()
+                                self._save_accounts_storage()
                                 self.awaiting_input = None
-                                await self.send_admin("✅ تم تحديث الجلسة بنجاح. جاري إعادة الاتصال...", self.build_main_keyboard())
+                                await self.send_admin(
+                                    f"✅ تم تحديث جلسة الحساب <b>{self.get_active_account()['name']}</b> (<code>{uid}</code>). جاري إعادة الاتصال...",
+                                    self.build_main_keyboard()
+                                )
                                 if self.ws:
                                     await self.ws.close()
                             else:
@@ -959,15 +1299,11 @@ class AboodControlBot:
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
-        if '"isDemo":1' not in self.auth_frame and '"isDemo": 1' not in self.auth_frame:
-            log("SAFETY", "تم إيقاف التنفيذ: الجلسة ليست لحساب تجريبي (isDemo: 1)!")
-            self.full_reset_to_scanning("جلسة غير تجريبية")
-            return
-
         ladder = self.get_trade_ladder()
         g_idx = g_idx % len(ladder)
         amount = ladder[g_idx]
         req_id = int(time.time() * 1000)
+        is_demo_flag = 1 if self.is_demo_mode else 0
 
         self.global_step_index = g_idx
         self.pair_step_index = p_idx
@@ -976,7 +1312,6 @@ class AboodControlBot:
         self.trade_entry_price = self.latest_prices.get(asset)
         self.mode = "IN_TRADE"
 
-        # تحديث محاسبة التعزيز والدورة
         self.current_cycle_spent += amount
         if self.boost_enabled and self.in_boost_recovery:
             self.recovery_balance -= amount
@@ -985,7 +1320,7 @@ class AboodControlBot:
             "asset": asset,
             "amount": amount,
             "action": direction,
-            "isDemo": 1,
+            "isDemo": is_demo_flag,
             "requestId": req_id,
             "optionType": 100,
             "time": TRADE_DURATION
@@ -995,14 +1330,16 @@ class AboodControlBot:
 
         sig_sym = self.format_signal_symbol(asset)
         dir_text = "🟢 CALL UP 📈" if direction == "call" else "🔴 PUT DOWN 📉"
+        mode_tag = "DEMO" if self.is_demo_mode else "LIVE"
         tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else (" (مواصلة النموذج 🔄)" if is_cont_entry else "")
         log(
             "TRADE_EXEC",
-            f"⚡ تنفيذ{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
+            f"⚡ تنفيذ [{mode_tag}]{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
             f"سعر الفتح: {self.trade_entry_price} | [عام {g_idx + 1}/{self.global_steps} | زوج {p_idx + 1}/{self.pair_steps}]"
         )
 
         if is_cont_entry:
+            # الصفقة العكسية تُنشر كبطاقة صفقة مستقلة حتى يردّ عليها البوت بنتيجتها الخاصة
             cont_msg = (
                 f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                 f"┃ 🔄 <b>مواصلة النموذج (دخول عكسي)</b>\n"
@@ -1011,13 +1348,14 @@ class AboodControlBot:
                 f"┃ {dir_text}\n"
                 f"╰━━━━━━━━━━━━━━━╯"
             )
-            asyncio.create_task(self.send_channel(cont_msg))
+            self.enqueue_new_signal(cont_msg)
         elif p_idx == 0 and not is_draw_retry:
+            # الرد المباشر بتأكيد الدخول على رسالة الإشارة الأساسية
             confirm_msg = (
                 f"🚀 <b>تم تأكيد الدخول في الصفقة ✅</b>\n"
                 f"🏛 <code>{sig_sym}</code> | {dir_text}"
             )
-            asyncio.create_task(self.send_channel(confirm_msg))
+            self.enqueue_signal_reply(self.current_signal_uid, confirm_msg)
 
     def evaluate_active_trade_result(self, asset: str, direction: str) -> str:
         current_price = self.latest_prices.get(asset)
@@ -1064,13 +1402,15 @@ class AboodControlBot:
 
                 asset = self.locked_pair
                 sig_sym = self.format_signal_symbol(asset)
+                sig_uid = self.current_signal_uid
                 eligible, payout = self.is_pair_eligible(asset)
                 if not eligible:
                     log("SKIP_PAYOUT", f"انخفض عائد {asset} إلى {payout}% — إلغاء الإشارة")
-                    asyncio.create_task(self.send_channel(
+                    self.enqueue_signal_reply(
+                        sig_uid,
                         f"⚪ <b>تم إلغاء الإشارة</b>\n"
                         f"🏛 <code>{sig_sym}</code>"
-                    ))
+                    )
                     self.switch_pair_keep_global("انخفاض نسبة العائد")
                     continue
 
@@ -1095,10 +1435,11 @@ class AboodControlBot:
                             trade_minute=next_trade_minute
                         )
                     else:
-                        asyncio.create_task(self.send_channel(
+                        self.enqueue_signal_reply(
+                            sig_uid,
                             f"⚪ <b>تم إلغاء الإشارة</b>\n"
                             f"🏛 <code>{sig_sym}</code>"
-                        ))
+                        )
                         self.switch_pair_keep_global("أغلقت حمراء عكس الشرط")
 
                 elif self.locked_direction == "call":
@@ -1110,10 +1451,11 @@ class AboodControlBot:
                             trade_minute=next_trade_minute
                         )
                     else:
-                        asyncio.create_task(self.send_channel(
+                        self.enqueue_signal_reply(
+                            sig_uid,
                             f"⚪ <b>تم إلغاء الإشارة</b>\n"
                             f"🏛 <code>{sig_sym}</code>"
-                        ))
+                        )
                         self.switch_pair_keep_global("أغلقت خضراء عكس الشرط")
 
             # 2) فحص الصفقة المفتوحة بناءً على وقت إغلاق الصفقة الفعلي وسعر دخولها الفعلي
@@ -1129,6 +1471,7 @@ class AboodControlBot:
 
                 asset = self.locked_pair
                 sig_sym = self.format_signal_symbol(asset)
+                sig_uid = self.current_signal_uid
                 direction = self.locked_direction
                 result = self.evaluate_active_trade_result(asset, direction)
 
@@ -1155,9 +1498,9 @@ class AboodControlBot:
                         f"┃ 🏆 <b>WIN{sup_num} ✅</b>\n"
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
-                    asyncio.create_task(self.send_channel(win_msg))
+                    # إرسال نتيجة الربح كردّ (Reply) على رسالة هذه الصفقة تحديدًا
+                    self.enqueue_signal_reply(sig_uid, win_msg)
 
-                    # تحديث محاسبة التعزيز عند الربح
                     self.current_cycle_spent = 0.0
                     if self.boost_enabled and self.in_boost_recovery:
                         payout_pct = self.payouts.get(asset, self.min_payout)
@@ -1170,10 +1513,9 @@ class AboodControlBot:
                             ))
                             self.reset_boost_state()
                         else:
-                            log("BOOST_PROG", f"🛡️ تقدم التعزيز: المتبقي للتعويض ${abs(self.recovery_balance):.2f} (الأساسي مستمر عند ${self.effective_base_amount:g})")
+                            log("BOOST_PROG", f"🛡️ تقدم التعزيز: المتبقي للتعويض ${abs(self.recovery_balance):.2f}")
 
-                    # التحقق من وضع "مواصلة النموذج":
-                    # إذا كان مفعّلاً + ربحت من أول دخول (attempt_num == 1) + ليست صفقة مواصلة سابقة
+                    # التحقق من وضع "مواصلة النموذج"
                     if self.continuation_enabled and attempt_num == 1 and not self.is_continuation_trade:
                         eligible, _ = self.is_pair_eligible(asset)
                         if eligible:
@@ -1193,13 +1535,11 @@ class AboodControlBot:
                             )
                             continue
 
-                    # في الحالات العادية أو بعد نجاح صفقة مواصلة النموذج -> الخروج للبحث عن عملة أخرى
                     self.full_reset_to_scanning(f"صفقة رابحة WIN{attempt_num}")
                     continue
 
                 # ==================== ب) حالة التعادل (DRAW) ====================
                 if result == "DRAW":
-                    # استرداد مبلغ التعادل في المحاسبة وإعادة الدخول بنفس المبلغ بدون تدبيل
                     self.current_cycle_spent -= won_amount
                     if self.boost_enabled and self.in_boost_recovery:
                         self.recovery_balance += won_amount
@@ -1219,7 +1559,6 @@ class AboodControlBot:
                 next_g_idx = self.global_step_index + 1
                 next_p_idx = self.pair_step_index + 1
 
-                # هل انتهت جميع خطوات التدبيل العام بخسارة؟
                 if next_g_idx >= self.global_steps:
                     self.record_trade_outcome(sig_sym, is_win=False, attempt_num=attempt_num)
                     loss_msg = (
@@ -1228,9 +1567,9 @@ class AboodControlBot:
                         f"┃ ❌ <b>LOSS</b>\n"
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
-                    asyncio.create_task(self.send_channel(loss_msg))
+                    # إرسال الخسارة كردّ (Reply) على رسالة الصفقة
+                    self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                    # تفعيل أو تصعيد وضع التعزيز إذا كان مفعّلاً من لوحة التحكم
                     if self.boost_enabled:
                         if not self.in_boost_recovery:
                             self.in_boost_recovery = True
@@ -1313,7 +1652,7 @@ class AboodControlBot:
                     f"┃ ⚠️ إذا أغلقت حمراء 🔴 ⬅️ لا تدخل\n"
                     f"╰━━━━━━━━━━━━━━━╯"
                 )
-                asyncio.create_task(self.send_channel(signal_msg))
+                self.enqueue_new_signal(signal_msg)
 
             # شرط الشراء: أخضر -> أخضر -> أحمر -> أخضر
             elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
@@ -1335,12 +1674,14 @@ class AboodControlBot:
                     f"┃ ⚠️ إذا أغلقت خضراء 🟢 ⬅️ لا تدخل\n"
                     f"╰━━━━━━━━━━━━━━━╯"
                 )
-                asyncio.create_task(self.send_channel(signal_msg))
+                self.enqueue_new_signal(signal_msg)
 
     async def handle_payload(self, event_name: str, data):
         if event_name == "successauth":
             self.authenticated = True
-            log("AUTH", "تم تأكيد المصادقة مع سيرفر Pocket Option بنجاح ✅")
+            acc = self.get_active_account()
+            mode_label = "التجريبي (Demo)" if self.is_demo_mode else "الحقيقي (Live)"
+            log("AUTH", f"تم تأكيد المصادقة للحساب [{acc['name']} | {acc['uid']}] في الوضع {mode_label} ✅")
             return
 
         if event_name == "updateAssets" and isinstance(data, list):
@@ -1348,8 +1689,11 @@ class AboodControlBot:
             return
 
         if event_name == "successupdateBalance" and isinstance(data, dict):
-            self.demo_balance = data.get("balance")
-            log("BALANCE", f"رصيد حساب الديمو الحالي: ${self.demo_balance}")
+            msg_is_demo = data.get("isDemo")
+            if msg_is_demo is None or bool(msg_is_demo) == self.is_demo_mode:
+                self.account_balance = data.get("balance")
+                mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
+                log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${self.account_balance}")
             return
 
         if event_name == "successopenOrder" and isinstance(data, dict):
@@ -1493,6 +1837,7 @@ class AboodControlBot:
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(connector=connector) as http_session:
             self.http_session = http_session
+            asyncio.create_task(self.channel_sender_worker())
             asyncio.create_task(self.telegram_polling_loop())
             asyncio.create_task(self.precision_entry_watcher())
             asyncio.create_task(self.daily_midnight_stats_scheduler())
