@@ -133,6 +133,10 @@ class AboodControlBot:
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
 
+        # ميزة المزدوج: الحد الأقصى للأزواج المراقبة معًا في نفس الدقيقة (1 = فردي، 2 فأكثر = مزدوج)
+        self.max_locked_pairs = 1
+        self.locked_candidates = []  # قائمة مرتبة بالأولوية: [{"asset", "direction", "target_minute", "signal_uid", "rank"}]
+
         # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
         self.accounts = []
         self.active_account_idx = 0
@@ -437,9 +441,19 @@ class AboodControlBot:
         """جدولة ردّ مباشر (Reply) على رسالة الصفقة المحددة"""
         self.channel_queue.put_nowait(("REPLY", signal_uid, text))
 
+    async def ensure_subscribed(self, pair: str):
+        """التأكد من الاشتراك في البث الحي للزوج لضمان وصول التكات حتى لحظة الإغلاق"""
+        if self.ws and self.authenticated and pair not in self.subscribed_pairs:
+            try:
+                await self.ws.send(f'42["subfor","{pair}"]')
+                self.subscribed_pairs.add(pair)
+            except Exception:
+                pass
+
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
         self.mode = "SCANNING"
+        self.locked_candidates.clear()
         self.locked_pair = None
         self.locked_direction = None
         self.locked_target_minute = None
@@ -453,6 +467,7 @@ class AboodControlBot:
     def full_reset_to_scanning(self, reason: str):
         log("MODE", f"إعادة ضبط كاملة والعودة للمسح ({reason})")
         self.mode = "SCANNING"
+        self.locked_candidates.clear()
         self.locked_pair = None
         self.locked_direction = None
         self.locked_target_minute = None
@@ -488,12 +503,20 @@ class AboodControlBot:
             if self.continuation_enabled
             else {"text": "🔄 مواصلة النموذج: متوقف 🔴", "callback_data": "toggle_cont"}
         )
+        dual_label = (
+            f"👯 المزدوج ({self.max_locked_pairs} أزواج)"
+            if self.max_locked_pairs > 1
+            else "👯 المزدوج (1 زوج - فردي)"
+        )
 
         return {
             "inline_keyboard": [
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
-                [{"text": f"🎯 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
+                [
+                    {"text": f"🎯 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"},
+                    {"text": dual_label, "callback_data": "set_dual_pairs"}
+                ],
                 [
                     {"text": f"💵 الأساسي (${self.base_amount:g})", "callback_data": "set_amount"},
                     {"text": f"📈 العائد (≥ {self.min_payout}%)", "callback_data": "set_payout"}
@@ -592,15 +615,24 @@ class AboodControlBot:
             boost_status = "🔴 متوقف"
 
         cont_status = "🟢 مفعّل (عكس الصفقة بعد WIN¹)" if self.continuation_enabled else "🔴 متوقف"
+        dual_status = (
+            f"<code>{self.max_locked_pairs} أزواج</code> (مراقبة متزامنة وأولوية للأول)"
+            if self.max_locked_pairs > 1
+            else "<code>1 زوج</code> (وضع فردي)"
+        )
 
-        mode_ar = {
-            "SCANNING": f"🔍 يبحث عن فرصة (الدخول القادم: ${current_next_amt})",
-            "LOCKED": f"🎯 مثبّت على {self.format_signal_symbol(self.locked_pair or '')} (الدخول: ${current_next_amt})",
-            "IN_TRADE": (
+        if self.mode == "LOCKED" and self.locked_candidates:
+            cand_names = " ⬅️ ".join(
+                f"#{c['rank']} {self.format_signal_symbol(c['asset'])}" for c in self.locked_candidates
+            )
+            mode_ar = f"🎯 مثبّت ({len(self.locked_candidates)}/{self.max_locked_pairs}): {cand_names} (الدخول: ${current_next_amt})"
+        elif self.mode == "IN_TRADE":
+            mode_ar = (
                 f"⚡ داخل صفقة على {self.format_signal_symbol(self.locked_pair or '')} "
                 f"[عام {self.global_step_index + 1}/{self.global_steps} | زوج {self.pair_step_index + 1}/{self.pair_steps}]"
             )
-        }.get(self.mode, self.mode)
+        else:
+            mode_ar = f"🔍 يبحث عن فرصة (الدخول القادم: ${current_next_amt})"
 
         return (
             f"♟ <b>لوحة إدارة عبود تريدينج (24/7)</b>\n"
@@ -614,6 +646,7 @@ class AboodControlBot:
             f"📊 <b>إحصائيات اليوم:</b> <code>{wins_today}/{total_today}</code> ({rate_today:.1f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
+            f"👯 <b>نظام المزدوج:</b> {dual_status}\n"
             f"📈 <b>الأصول المؤهلة (≥{self.min_payout}%):</b> <code>{eligible_count}</code> من {len(active_pairs)}\n"
             f"💵 <b>المبلغ الأساسي:</b> <code>${self.base_amount:g}</code>\n"
             f"🌐 <b>التدبيل العام ({self.global_steps}):</b> <code>{ladder_str}</code>\n"
@@ -681,7 +714,6 @@ class AboodControlBot:
                     msg_id = await self.send_channel(text, reply_to_message_id=None)
                     if uid is not None and msg_id is not None:
                         self.signal_msg_ids[uid] = msg_id
-                        # تنظيف المعرفات القديمة للاحتفاظ بآخر 100 إشارة فقط
                         if len(self.signal_msg_ids) > 100:
                             oldest_uid = min(self.signal_msg_ids.keys())
                             del self.signal_msg_ids[oldest_uid]
@@ -740,9 +772,15 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "set_dual_pairs":
+                            self.awaiting_input = "DUAL_PAIRS"
+                            await self.send_admin(
+                                "👯 <b>ضبط نظام المزدوج (مراقبة عدة أزواج معًا):</b>\n"
+                                "أرسل الآن عدد الأزواج المسموح مسكها ومراقبتها معًا قبل إغلاق الدقيقة (مثال: <code>3</code> لمراقبة 3 أزواج بالأولوية، أو <code>1</code> للوضع الفردي):"
+                            )
+                            continue
                         elif data == "toggle_account_mode":
                             if self.is_demo_mode:
-                                # طلب تأكيد قبل التحويل للحساب الحقيقي للأمان
                                 acc = self.get_active_account()
                                 await self.tg_api("editMessageText", {
                                     "chat_id": ADMIN_CHAT_ID,
@@ -764,7 +802,6 @@ class AboodControlBot:
                                 })
                                 continue
                             else:
-                                # العودة الفورية للحساب التجريبي
                                 self.is_demo_mode = True
                                 self.account_balance = None
                                 self._sync_active_auth_frame()
@@ -889,7 +926,7 @@ class AboodControlBot:
                         elif data.startswith("scope_"):
                             self.scan_scope = data.replace("scope_", "")
                             log("SCOPE", f"تم تغيير مستوى المسح إلى: {self.get_scope_label()}")
-                            if self.mode == "SCANNING":
+                            if self.mode in ("SCANNING", "LOCKED"):
                                 self.switch_pair_keep_global("تغيير مستوى المسح")
                         elif data == "set_amount":
                             self.awaiting_input = "BASE_AMOUNT"
@@ -972,7 +1009,23 @@ class AboodControlBot:
                             )
                             continue
 
-                        if self.awaiting_input == "ADD_ACC_NAME":
+                        if self.awaiting_input == "DUAL_PAIRS":
+                            try:
+                                cnt = int(text)
+                                if 1 <= cnt <= 10:
+                                    self.max_locked_pairs = cnt
+                                    self.awaiting_input = None
+                                    desc = "الوضع الفردي (زوج واحد)" if cnt == 1 else f"مراقبة حتى <b>{cnt} أزواج</b> معًا حسب الأولوية"
+                                    await self.send_admin(
+                                        f"✅ تم ضبط نظام المزدوج إلى: {desc}.",
+                                        self.build_main_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل عددًا بين 1 و 10:")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>3</code>):")
+
+                        elif self.awaiting_input == "ADD_ACC_NAME":
                             self.temp_new_acc_name = text[:30]
                             self.awaiting_input = "ADD_ACC_AUTH"
                             await self.send_admin(
@@ -1284,7 +1337,7 @@ class AboodControlBot:
         )
 
     # ==========================================
-    # التنفيذ الفوري، التدبيل، التعزيز، ومواصلة النموذج
+    # التنفيذ الفوري، المزدوج بالأولوية، التدبيل، والتعزيز
     # ==========================================
     async def open_trade(
         self,
@@ -1305,6 +1358,8 @@ class AboodControlBot:
         req_id = int(time.time() * 1000)
         is_demo_flag = 1 if self.is_demo_mode else 0
 
+        self.locked_pair = asset
+        self.locked_direction = direction
         self.global_step_index = g_idx
         self.pair_step_index = p_idx
         self.active_trade_minute = trade_minute
@@ -1339,7 +1394,6 @@ class AboodControlBot:
         )
 
         if is_cont_entry:
-            # الصفقة العكسية تُنشر كبطاقة صفقة مستقلة حتى يردّ عليها البوت بنتيجتها الخاصة
             cont_msg = (
                 f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                 f"┃ 🔄 <b>مواصلة النموذج (دخول عكسي)</b>\n"
@@ -1350,7 +1404,6 @@ class AboodControlBot:
             )
             self.enqueue_new_signal(cont_msg)
         elif p_idx == 0 and not is_draw_retry:
-            # الرد المباشر بتأكيد الدخول على رسالة الإشارة الأساسية
             confirm_msg = (
                 f"🚀 <b>تم تأكيد الدخول في الصفقة ✅</b>\n"
                 f"🏛 <code>{sig_sym}</code> | {dir_text}"
@@ -1382,15 +1435,21 @@ class AboodControlBot:
 
     async def precision_entry_watcher(self):
         while True:
-            if not self.is_running or self.mode == "SCANNING" or not self.locked_pair:
+            if not self.is_running or self.mode == "SCANNING":
                 await asyncio.sleep(0.05)
                 continue
 
             server_now = self.get_server_now()
 
-            # 1) فحص الشمعة الخامسة في آخر أجزاء من الثانية للدخول الأساسي
-            if self.mode == "LOCKED" and self.locked_target_minute:
-                candle_close_ts = self.locked_target_minute + 60.0 + SERVER_CLOCK_OFFSET
+            # 1) فحص الأزواج الممسوكة (المزدوج) في آخر أجزاء من الثانية والدخول في الأولى التي تستوفي الشرط
+            if self.mode == "LOCKED":
+                if not self.locked_candidates:
+                    self.switch_pair_keep_global("قائمة الانتظار فارغة")
+                    continue
+
+                # أقرب وقت إغلاق بين الأزواج الممسوكة
+                earliest_minute = min(c["target_minute"] for c in self.locked_candidates)
+                candle_close_ts = earliest_minute + 60.0 + SERVER_CLOCK_OFFSET
                 remaining = candle_close_ts - server_now
 
                 if remaining > 2.0:
@@ -1400,66 +1459,99 @@ class AboodControlBot:
                     await asyncio.sleep(0.001)
                     continue
 
-                asset = self.locked_pair
-                sig_sym = self.format_signal_symbol(asset)
-                sig_uid = self.current_signal_uid
-                eligible, payout = self.is_pair_eligible(asset)
-                if not eligible:
-                    log("SKIP_PAYOUT", f"انخفض عائد {asset} إلى {payout}% — إلغاء الإشارة")
-                    self.enqueue_signal_reply(
-                        sig_uid,
-                        f"⚪ <b>تم إلغاء الإشارة</b>\n"
-                        f"🏛 <code>{sig_sym}</code>"
+                # تجميع المرشحين الذين حان وقت إغلاقهم الآن مرتّبين بالأولوية (#1 ثم #2 ثم #3...)
+                due_candidates = [c for c in self.locked_candidates if c["target_minute"] <= earliest_minute]
+                future_candidates = [c for c in self.locked_candidates if c["target_minute"] > earliest_minute]
+
+                chosen_candidate = None
+
+                for cand in due_candidates:
+                    asset = cand["asset"]
+                    sig_sym = self.format_signal_symbol(asset)
+                    sig_uid = cand["signal_uid"]
+                    direction = cand["direction"]
+                    target_min = cand["target_minute"]
+                    rank = cand["rank"]
+
+                    eligible, payout = self.is_pair_eligible(asset)
+                    if not eligible:
+                        log("SKIP_PAYOUT", f"[#{rank}] انخفض عائد {asset} إلى {payout}% — إلغاء الإشارة")
+                        self.enqueue_signal_reply(
+                            sig_uid,
+                            f"⚪ <b>تم إلغاء الإشارة</b>\n"
+                            f"🏛 <code>{sig_sym}</code>"
+                        )
+                        continue
+
+                    target_candle = self.candles.get(asset, {}).get(target_min)
+                    if not target_candle:
+                        log("SKIP_DATA", f"[#{rank}] فقدان بيانات شمعة {asset} — إلغاء الإشارة")
+                        self.enqueue_signal_reply(
+                            sig_uid,
+                            f"⚪ <b>تم إلغاء الإشارة</b>\n"
+                            f"🏛 <code>{sig_sym}</code>"
+                        )
+                        continue
+
+                    live_color = candle_color(target_candle["open"], target_candle["close"])
+                    condition_met = (
+                        (direction == "put" and live_color == "GREEN") or
+                        (direction == "call" and live_color == "RED")
                     )
-                    self.switch_pair_keep_global("انخفاض نسبة العائد")
-                    continue
 
-                target_candle = self.candles.get(asset, {}).get(self.locked_target_minute)
-                if not target_candle:
-                    self.switch_pair_keep_global("فقدان بيانات الشمعة")
-                    continue
+                    log(
+                        "PRE_CLOSE",
+                        f"⏱ فحص [#{rank}] قبل الإغلاق بـ {max(0.0, remaining):.3f}ث | {asset} | "
+                        f"{color_label(live_color)} => {'مطابق ✅' if condition_met else 'مخالف ❌'}"
+                    )
 
-                live_color = candle_color(target_candle["open"], target_candle["close"])
-                next_trade_minute = self.locked_target_minute + 60
-                log(
-                    "PRE_CLOSE",
-                    f"⏱ فحص قبل الإغلاق بـ {max(0.0, remaining):.3f}ث (المضبوط: {self.entry_lead_seconds}ث) | {asset} | {color_label(live_color)}"
-                )
-
-                if self.locked_direction == "put":
-                    if live_color == "GREEN":
-                        await self.open_trade(
-                            asset, "put",
-                            g_idx=self.global_step_index,
-                            p_idx=0,
-                            trade_minute=next_trade_minute
-                        )
+                    if condition_met:
+                        chosen_candidate = cand
+                        break
                     else:
+                        # لم تستوفِ الشرط -> إلغاء والانتقال فورًا للمرشح التالي في الأولوية
                         self.enqueue_signal_reply(
                             sig_uid,
                             f"⚪ <b>تم إلغاء الإشارة</b>\n"
                             f"🏛 <code>{sig_sym}</code>"
                         )
-                        self.switch_pair_keep_global("أغلقت حمراء عكس الشرط")
 
-                elif self.locked_direction == "call":
-                    if live_color == "RED":
-                        await self.open_trade(
-                            asset, "call",
-                            g_idx=self.global_step_index,
-                            p_idx=0,
-                            trade_minute=next_trade_minute
-                        )
-                    else:
+                if chosen_candidate is not None:
+                    # إلغاء جميع المرشحين المتبقين (ذوي الأولوية الأقل) فور اختيار الصفقة الأولى المستوفية
+                    chosen_idx = due_candidates.index(chosen_candidate)
+                    remaining_to_cancel = due_candidates[chosen_idx + 1:] + future_candidates
+                    for other in remaining_to_cancel:
+                        other_sym = self.format_signal_symbol(other["asset"])
+                        log("DUAL_CANCEL", f"إلغاء [#{other['rank']}] {other_sym} لأن [#{chosen_candidate['rank']}] استوفى الشرط أولاً.")
                         self.enqueue_signal_reply(
-                            sig_uid,
-                            f"⚪ <b>تم إلغاء الإشارة</b>\n"
-                            f"🏛 <code>{sig_sym}</code>"
+                            other["signal_uid"],
+                            f"⚪ <b>تم إلغاء الإشارة (تم الدخول في الأولوية #{chosen_candidate['rank']})</b>\n"
+                            f"🏛 <code>{other_sym}</code>"
                         )
-                        self.switch_pair_keep_global("أغلقت خضراء عكس الشرط")
+
+                    self.locked_candidates.clear()
+                    self.current_signal_uid = chosen_candidate["signal_uid"]
+                    next_trade_minute = chosen_candidate["target_minute"] + 60
+                    await self.open_trade(
+                        chosen_candidate["asset"],
+                        chosen_candidate["direction"],
+                        g_idx=self.global_step_index,
+                        p_idx=0,
+                        trade_minute=next_trade_minute
+                    )
+                else:
+                    # لم تستوفِ أي من الصفقات المنتظرة لهذه الدقيقة الشرط
+                    if future_candidates:
+                        self.locked_candidates = future_candidates
+                        self.locked_pair = future_candidates[0]["asset"]
+                        self.locked_direction = future_candidates[0]["direction"]
+                        self.locked_target_minute = future_candidates[0]["target_minute"]
+                        self.current_signal_uid = future_candidates[0]["signal_uid"]
+                    else:
+                        self.switch_pair_keep_global("لم تستوفِ أي من الأزواج الممسوكة الشرط")
 
             # 2) فحص الصفقة المفتوحة بناءً على وقت إغلاق الصفقة الفعلي وسعر دخولها الفعلي
-            elif self.mode == "IN_TRADE" and self.active_trade_close_ts:
+            elif self.mode == "IN_TRADE" and self.active_trade_close_ts and self.locked_pair:
                 remaining = self.active_trade_close_ts - server_now
 
                 if remaining > 2.0:
@@ -1498,7 +1590,6 @@ class AboodControlBot:
                         f"┃ 🏆 <b>WIN{sup_num} ✅</b>\n"
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
-                    # إرسال نتيجة الربح كردّ (Reply) على رسالة هذه الصفقة تحديدًا
                     self.enqueue_signal_reply(sig_uid, win_msg)
 
                     self.current_cycle_spent = 0.0
@@ -1567,7 +1658,6 @@ class AboodControlBot:
                         f"┃ ❌ <b>LOSS</b>\n"
                         f"╰━━━━━━━━━━━━━━━╯"
                     )
-                    # إرسال الخسارة كردّ (Reply) على رسالة الصفقة
                     self.enqueue_signal_reply(sig_uid, loss_msg)
 
                     if self.boost_enabled:
@@ -1609,7 +1699,8 @@ class AboodControlBot:
         if not self.is_running:
             return
 
-        if asset not in self.get_active_scan_pairs() and asset != self.locked_pair:
+        locked_assets = {c["asset"] for c in self.locked_candidates}
+        if asset not in self.get_active_scan_pairs() and asset != self.locked_pair and asset not in locked_assets:
             return
 
         eligible, payout = self.is_pair_eligible(asset)
@@ -1618,7 +1709,11 @@ class AboodControlBot:
 
         self.print_five_candles(asset, force=force_print)
 
-        if self.mode == "SCANNING":
+        # في وضع SCANNING أو LOCKED طالما لم نصل للحد الأقصى للمزدوج، يمكننا التقاط فرص إضافية
+        if self.mode in ("SCANNING", "LOCKED") and len(self.locked_candidates) < self.max_locked_pairs:
+            if asset in locked_assets:
+                return
+
             data = self.get_last_five(asset)
             if data is None:
                 return
@@ -1631,19 +1726,14 @@ class AboodControlBot:
             sig_sym = self.format_signal_symbol(asset)
             real_entry_ts = (m_open + 60) - self.server_hour_shift
             entry_time_str = datetime.fromtimestamp(real_entry_ts, tz=TZ_UTC3).strftime("%H:%M:%S")
+            rank = len(self.locked_candidates) + 1
+            priority_line = f"┃ 🔢 الأولوية  <b>#{rank}</b>\n" if self.max_locked_pairs > 1 else ""
 
             # شرط البيع: أحمر -> أحمر -> أخضر -> أحمر
             if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
-                self.mode = "LOCKED"
-                self.locked_pair = asset
-                self.locked_direction = "put"
-                self.locked_target_minute = m_open
-                self.pair_step_index = 0
-                self.is_continuation_trade = False
-                log("LOCK", f"🎯 رصد نموذج بيع على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
-
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
+                    f"{priority_line}"
                     f"┃ 🏛 <code>{sig_sym}</code>\n"
                     f"┃ ⏰ Entry  <code>{entry_time_str}</code> [UTC+3]\n"
                     f"┃ ⏱ Expiry  M1\n"
@@ -1652,20 +1742,33 @@ class AboodControlBot:
                     f"┃ ⚠️ إذا أغلقت حمراء 🔴 ⬅️ لا تدخل\n"
                     f"╰━━━━━━━━━━━━━━━╯"
                 )
-                self.enqueue_new_signal(signal_msg)
+                sig_uid = self.enqueue_new_signal(signal_msg)
+                self.locked_candidates.append({
+                    "asset": asset,
+                    "direction": "put",
+                    "target_minute": m_open,
+                    "signal_uid": sig_uid,
+                    "rank": rank
+                })
+                self.mode = "LOCKED"
+                if rank == 1:
+                    self.locked_pair = asset
+                    self.locked_direction = "put"
+                    self.locked_target_minute = m_open
+                    self.pair_step_index = 0
+                    self.is_continuation_trade = False
+
+                asyncio.create_task(self.ensure_subscribed(asset))
+                log(
+                    "LOCK",
+                    f"🎯 رصد نموذج بيع [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
+                )
 
             # شرط الشراء: أخضر -> أخضر -> أحمر -> أخضر
             elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
-                self.mode = "LOCKED"
-                self.locked_pair = asset
-                self.locked_direction = "call"
-                self.locked_target_minute = m_open
-                self.pair_step_index = 0
-                self.is_continuation_trade = False
-                log("LOCK", f"🎯 رصد نموذج شراء على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]")
-
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
+                    f"{priority_line}"
                     f"┃ 🏛 <code>{sig_sym}</code>\n"
                     f"┃ ⏰ Entry  <code>{entry_time_str}</code> [UTC+3]\n"
                     f"┃ ⏱ Expiry  M1\n"
@@ -1674,7 +1777,27 @@ class AboodControlBot:
                     f"┃ ⚠️ إذا أغلقت خضراء 🟢 ⬅️ لا تدخل\n"
                     f"╰━━━━━━━━━━━━━━━╯"
                 )
-                self.enqueue_new_signal(signal_msg)
+                sig_uid = self.enqueue_new_signal(signal_msg)
+                self.locked_candidates.append({
+                    "asset": asset,
+                    "direction": "call",
+                    "target_minute": m_open,
+                    "signal_uid": sig_uid,
+                    "rank": rank
+                })
+                self.mode = "LOCKED"
+                if rank == 1:
+                    self.locked_pair = asset
+                    self.locked_direction = "call"
+                    self.locked_target_minute = m_open
+                    self.pair_step_index = 0
+                    self.is_continuation_trade = False
+
+                asyncio.create_task(self.ensure_subscribed(asset))
+                log(
+                    "LOCK",
+                    f"🎯 رصد نموذج شراء [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
+                )
 
     async def handle_payload(self, event_name: str, data):
         if event_name == "successauth":
@@ -1708,11 +1831,12 @@ class AboodControlBot:
 
         if event_name == "updateStream":
             if isinstance(data, list):
+                locked_assets = {c["asset"] for c in self.locked_candidates}
                 for item in data:
                     if isinstance(item, list) and len(item) >= 3:
                         asset, ts, price = str(item[0]), item[1], float(item[2])
                         self.update_candle_from_tick(asset, ts, price)
-                        if self.mode == "SCANNING" or asset == self.locked_pair:
+                        if self.mode == "SCANNING" or asset == self.locked_pair or asset in locked_assets:
                             await self.process_market_logic(asset, force_print=False)
             return
 
@@ -1757,7 +1881,8 @@ class AboodControlBot:
                 await asyncio.sleep(1)
                 continue
 
-            if self.mode in ("LOCKED", "IN_TRADE") and self.locked_pair:
+            # إذا كنا داخل صفقة فعلية -> نركز على زوج الصفقة فقط
+            if self.mode == "IN_TRADE" and self.locked_pair:
                 pair = self.locked_pair
                 self.active_symbol = pair
                 try:
@@ -1767,13 +1892,30 @@ class AboodControlBot:
                 await asyncio.sleep(2)
                 continue
 
+            # إذا وصلنا للحد الأقصى للمزدوج (مثلاً 3/3) -> نثبّت المراقبة حتى الإغلاق
+            if self.mode == "LOCKED" and len(self.locked_candidates) >= self.max_locked_pairs:
+                pair = self.locked_candidates[0]["asset"]
+                self.active_symbol = pair
+                try:
+                    await ws.send(f'42["changeSymbol",{{"asset":"{pair}","period":60}}]')
+                except Exception:
+                    break
+                await asyncio.sleep(1.5)
+                continue
+
             active_pairs = self.get_active_scan_pairs()
             if not active_pairs:
                 await asyncio.sleep(1)
                 continue
 
+            locked_assets = {c["asset"] for c in self.locked_candidates}
             pair = active_pairs[idx % len(active_pairs)]
             idx += 1
+
+            # تخطي الأزواج الممسوكة مسبقًا في نفس الدقيقة أثناء البحث عن فرص مزدوجة إضافية
+            if pair in locked_assets:
+                await asyncio.sleep(0.05)
+                continue
 
             eligible, payout = self.is_pair_eligible(pair)
             if self.payouts and not eligible:
@@ -1805,7 +1947,7 @@ class AboodControlBot:
                 break
 
             await asyncio.sleep(SCAN_INTERVAL_PER_PAIR)
-            if self.mode == "SCANNING" and self.is_running:
+            if self.mode in ("SCANNING", "LOCKED") and self.is_running:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
