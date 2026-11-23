@@ -20,7 +20,7 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية
-DEFAULT_LEAD_SECONDS = 0.25
+DEFAULT_LEAD_SECONDS = 0.10
 
 # تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
 SERVER_CLOCK_OFFSET = 0.75
