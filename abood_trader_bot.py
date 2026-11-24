@@ -233,11 +233,11 @@ class AboodControlBot:
         self._load_accounts_storage()
 
         # ==========================================
-        # نظام التعزيز الذكي (وضع تعويض القمة أو وضع عدد الصفقات الناجحة)
+        # نظام التعزيز الذكي (زيادة مرة واحدة فقط حتى تعويض الخسارة أو إكمال الصفقات)
         # ==========================================
         self.boost_enabled = False
         self.boost_mode = "CAPITAL"          # "CAPITAL" = تعويض رأس المال للقمة | "TRADES" = عدد صفقات ناجحة محددة
-        self.boost_increment = 10.0          # مقدار الزيادة على المبلغ الأساسي بعد خسارة دورة التدبيل
+        self.boost_increment = 10.0          # مقدار الزيادة الواحدة على المبلغ الأساسي عند الخسارة
         self.boost_target_wins = 5           # عدد الصفقات الناجحة المطلوبة في وضع "TRADES"
         self.boost_wins_done = 0             # عداد الصفقات الناجحة المنجزة أثناء التعزيز
         self.effective_base_amount = 10.0    # المبلغ الأساسي العامل حاليًا
@@ -799,7 +799,7 @@ class AboodControlBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة:</b> {en_str}\n"
             f"🎯 <b>نظام التعزيز:</b> {mode_str}\n"
-            f"➕ <b>مقدار الزيادة عند الخسارة:</b> <code>+${self.boost_increment:g}</code>\n"
+            f"➕ <b>مقدار الزيادة الواحدة:</b> <code>+${self.boost_increment:g}</code> (ثابتة طوال التعويض)\n"
             f"🏆 <b>عدد الصفقات المستهدفة:</b> <code>{self.boost_target_wins} صفقات ناجحة</code>\n"
             f"🏔 <b>قمة رأس المال المسجلة:</b> <code>{peak_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1403,7 +1403,7 @@ class AboodControlBot:
                         elif data == "set_boost_inc":
                             self.awaiting_input = "BOOST_INC"
                             await self.send_admin(
-                                "🛡️ أرسل الآن <b>مقدار الزيادة في التعزيز</b> التي تُضاف على المبلغ الأساسي بعد الخسارة "
+                                "🛡️ أرسل الآن <b>مقدار الزيادة الواحدة في التعزيز</b> التي تُضاف على المبلغ الأساسي عند الخسارة "
                                 "(مثال: <code>2</code> أو <code>10</code>):"
                             )
                             continue
@@ -1618,7 +1618,9 @@ class AboodControlBot:
                                 val = float(text)
                                 if val >= 1:
                                     self.base_amount = val
-                                    if not self.in_boost_recovery:
+                                    if self.in_boost_recovery:
+                                        self.effective_base_amount = val + self.boost_increment
+                                    else:
                                         self.effective_base_amount = val
                                     self.awaiting_input = None
                                     await self.send_admin(
@@ -1634,9 +1636,11 @@ class AboodControlBot:
                                 inc = float(text)
                                 if inc >= 1:
                                     self.boost_increment = inc
+                                    if self.in_boost_recovery:
+                                        self.effective_base_amount = self.base_amount + inc
                                     self.awaiting_input = None
                                     await self.send_admin(
-                                        f"✅ تم ضبط زيادة التعزيز إلى <b>+${inc:g}</b> بعد خسارة التدبيل العام.",
+                                        f"✅ تم ضبط زيادة التعزيز الواحدة إلى <b>+${inc:g}</b> عند الخسارة.",
                                         self.build_boost_keyboard()
                                     )
                             except ValueError:
@@ -2162,14 +2166,13 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # في حال إيقاف التدبيل وتفعيل التعزيز: الخسارة الواحدة تعتبر دورة كاملة وتفعّل التعزيز
-                        if self.boost_enabled:
-                            if not self.in_boost_recovery:
-                                self.in_boost_recovery = True
-                                self.boost_wins_done = 0
-                                if self.peak_balance is None and self.account_balance is not None:
-                                    self.peak_balance = float(self.account_balance) + self.current_cycle_spent
-                            self.effective_base_amount += self.boost_increment
+                        # زيادة التعزيز مرة واحدة فقط عند أول خسارة والبقاء عليه حتى التعويض
+                        if self.boost_enabled and not self.in_boost_recovery:
+                            self.in_boost_recovery = True
+                            self.boost_wins_done = 0
+                            if self.peak_balance is None and self.account_balance is not None:
+                                self.peak_balance = float(self.account_balance) + self.current_cycle_spent
+                            self.effective_base_amount = self.base_amount + self.boost_increment
                             self._notify_boost_activated()
 
                         self.current_cycle_spent = 0.0
@@ -2188,14 +2191,13 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # تفعيل أو تصعيد التعزيز عند خسارة التدبيل العام بالكامل
-                        if self.boost_enabled:
-                            if not self.in_boost_recovery:
-                                self.in_boost_recovery = True
-                                self.boost_wins_done = 0
-                                if self.peak_balance is None and self.account_balance is not None:
-                                    self.peak_balance = float(self.account_balance) + self.current_cycle_spent
-                            self.effective_base_amount += self.boost_increment
+                        # تفعيل التعزيز مرة واحدة فقط عند خسارة الدورة والبقاء عليه حتى التعويض
+                        if self.boost_enabled and not self.in_boost_recovery:
+                            self.in_boost_recovery = True
+                            self.boost_wins_done = 0
+                            if self.peak_balance is None and self.account_balance is not None:
+                                self.peak_balance = float(self.account_balance) + self.current_cycle_spent
+                            self.effective_base_amount = self.base_amount + self.boost_increment
                             self._notify_boost_activated()
 
                         self.current_cycle_spent = 0.0
@@ -2350,21 +2352,21 @@ class AboodControlBot:
             bal_txt = f"${format_money(self.account_balance)}" if self.account_balance is not None else "—"
             log(
                 "BOOST_UP",
-                f"🛡️ تعزيز (تعويض القمة)! الأساسي الجديد: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
+                f"🛡️ تفعيل التعزيز الثابت (تعويض القمة)! الأساسي المعزّز: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
             )
             asyncio.create_task(self.send_admin(
-                f"🛡️ <b>تم تفعيل/تصعيد التعزيز (تعويض القمة)!</b>\n"
-                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
+                f"🛡️ <b>تم تفعيل التعزيز الثابت (تعويض القمة)!</b>\n"
+                f"💵 المبلغ الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> (مستمر حتى التعويض)\n"
                 f"💰 الرصيد الحالي: <code>{bal_txt}</code> ⬅️ القمة المستهدفة: <code>{peak_txt}</code>"
             ))
         else:
             log(
                 "BOOST_UP",
-                f"🛡️ تعزيز (عدد صفقات)! الأساسي الجديد: ${self.effective_base_amount:g} | الهدف: {self.boost_target_wins} صفقات ناجحة"
+                f"🛡️ تفعيل التعزيز الثابت (عدد صفقات)! الأساسي المعزّز: ${self.effective_base_amount:g} | الهدف: {self.boost_target_wins} صفقات ناجحة"
             )
             asyncio.create_task(self.send_admin(
-                f"🛡️ <b>تم تفعيل/تصعيد التعزيز (عدد صفقات)!</b>\n"
-                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
+                f"🛡️ <b>تم تفعيل التعزيز الثابت (عدد صفقات)!</b>\n"
+                f"💵 المبلغ الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> (مستمر حتى إكمال الصفقات)\n"
                 f"🏆 المطلوب: <code>{self.boost_target_wins} صفقات ناجحة</code> للعودة للأساسي الأصلي."
             ))
 
