@@ -125,24 +125,104 @@ def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
     return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
 
 
+# ==========================================
+# دوال حساب المؤشرات الفنية (بدون مكتبات خارجية)
+# ==========================================
+def calc_rsi(closes: list[float], period: int = 14) -> float | None:
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def calc_bollinger(closes: list[float], period: int = 20, mult: float = 2.0) -> tuple[float, float, float] | None:
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mid = sum(window) / period
+    variance = sum((x - mid) ** 2 for x in window) / period
+    std = variance ** 0.5
+    return (mid - mult * std), mid, (mid + mult * std)
+
+
+def calc_stochastic(candles_list: list[dict], k_period: int = 5, smooth: int = 3) -> float | None:
+    if len(candles_list) < k_period + smooth - 1:
+        return None
+    raw_k = []
+    for i in range(len(candles_list) - smooth + 1, len(candles_list) + 1):
+        window = candles_list[i - k_period:i]
+        hh = max(c.get("high", max(c["open"], c["close"])) for c in window)
+        ll = min(c.get("low", min(c["open"], c["close"])) for c in window)
+        cc = window[-1]["close"]
+        if hh == ll:
+            raw_k.append(50.0)
+        else:
+            raw_k.append(((cc - ll) / (hh - ll)) * 100.0)
+    return sum(raw_k) / len(raw_k)
+
+
+def calc_atr(candles_list: list[dict], period: int = 14) -> float | None:
+    if len(candles_list) < period + 1:
+        return None
+    trs = []
+    for i in range(-period, 0):
+        curr = candles_list[i]
+        prev = candles_list[i - 1]
+        h = curr.get("high", max(curr["open"], curr["close"]))
+        l = curr.get("low", min(curr["open"], curr["close"]))
+        pc = prev["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / period
+
+
 class AboodControlBot:
     def __init__(self):
         # الإعدادات الأساسية القابلة للتحكم من تليجرام
         self.is_running = False
         self.base_amount = 10.0
-        self.martingale_enabled = True       # زر إيقاف وتشغيل التدبيل في أي وقت
+        self.martingale_enabled = True
         self.global_steps = 6
         self.pair_steps = 4
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
 
-        # الوضع السريع (Turbo Mode): مسح مستمر وتجهيز صفقات جديدة بالتوازي مع الصفقات المفتوحة والتدبيل
+        # الوضع السريع (Turbo Mode)
         self.fast_mode = False
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
         self.max_concurrent_trades = 1
-        self.locked_candidates = []          # [{"asset", "direction", "target_minute", "signal_uid", "rank"}]
+        self.locked_candidates = []
+
+        # ==========================================
+        # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
+        # ==========================================
+        self.indicators_enabled = False       # الزر العام للتشغيل/الإيقاف (متوقف افتراضيًا للاعتماد على الشطرنج وحده عند الرغبة)
+        self.ind_bb_enabled = True            # مؤشر البولينجر باند (20, 2)
+        self.ind_bb_zone = 0.70               # 70% من المسافة بين المنتصف والحد الخارجي (شرط متوسط غير صارم)
+        self.ind_rsi_enabled = True           # مؤشر RSI (14)
+        self.ind_rsi_period = 14
+        self.ind_rsi_overbought = 62.0        # تشبع شرائي متوسط (62 بدل 70)
+        self.ind_rsi_oversold = 38.0          # تشبع بيعي متوسط (38 بدل 30)
+        self.ind_wick_enabled = True          # فلتر جسم الشمعة والذيل (منع الدوجي والذيل العكسي العنيف)
+        self.ind_stoch_enabled = False        # مؤشر ستوكاستيك (5, 3, 3) اختياري
+        self.ind_stoch_overbought = 75.0
+        self.ind_stoch_oversold = 25.0
+        self.ind_atr_enabled = False          # فلتر السيولة ATR (14) اختياري
+        self.last_ind_skip_log = {}
 
         # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
         self.accounts = []
@@ -196,7 +276,7 @@ class AboodControlBot:
         self.signal_msg_ids = {}
 
         # إدارة الصفقات المفتوحة
-        self.mode = "SCANNING"               # SCANNING | LOCKED | IN_TRADE
+        self.mode = "SCANNING"
         self.active_trades = []
         self.trade_seq = 0
         self.global_step_index = 0
@@ -206,6 +286,120 @@ class AboodControlBot:
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         self.daily_records = []
         self.total_turnover = 0.0
+
+    # ==========================================
+    # محرك تقييم المؤشرات والفلاتر (بشروط متوسطة)
+    # ==========================================
+    def check_indicators(self, asset: str, direction: str, is_pre_close: bool = False) -> tuple[bool, str]:
+        """
+        يفحص المؤشرات المفعّلة إذا كان الزر العام للمؤشرات مفعّلاً.
+        is_pre_close=False: فحص تمهيدي مرن أثناء المسح.
+        is_pre_close=True: فحص نهائي متوسط قبل الإغلاق مباشرة.
+        """
+        if not self.indicators_enabled:
+            return True, "الشطرنج فقط"
+
+        pair_candles = self.candles.get(asset, {})
+        sorted_minutes = sorted(pair_candles.keys())
+        if len(sorted_minutes) < 6:
+            return True, "بيانات أولية"
+
+        ordered_candles = [pair_candles[m] for m in sorted_minutes[-60:]]
+        closes = [c["close"] for c in ordered_candles]
+        last_c = ordered_candles[-1]
+        o_price = last_c["open"]
+        c_price = last_c["close"]
+        h_price = last_c.get("high", max(o_price, c_price))
+        l_price = last_c.get("low", min(o_price, c_price))
+
+        # 1) فلتر جسم الشمعة والذيل (يُفحص بدقة عند اقتراب الإغلاق)
+        if self.ind_wick_enabled and is_pre_close:
+            body = abs(c_price - o_price)
+            total_range = max(h_price - l_price, body)
+            if total_range <= 0:
+                return False, "شمعة ساكنة بدون حركة"
+            if (body / total_range) < 0.20:
+                return False, f"جسم الشمعة صغير جدًا ({int((body / total_range) * 100)}%)"
+            if direction == "put":
+                upper_wick = h_price - max(o_price, c_price)
+                if upper_wick > (2.2 * body):
+                    return False, "ذيل علوي طويل معاكس للبيع"
+            elif direction == "call":
+                lower_wick = min(o_price, c_price) - l_price
+                if lower_wick > (2.2 * body):
+                    return False, "ذيل سفلي طويل معاكس للشراء"
+
+        # 2) مؤشر البولينجر باند (Bollinger Bands 20, 2)
+        if self.ind_bb_enabled:
+            bb = calc_bollinger(closes, period=20, mult=2.0)
+            if bb is not None:
+                lower, mid, upper = bb
+                half_band = upper - mid
+                if half_band > 0:
+                    req_zone = self.ind_bb_zone if is_pre_close else max(0.45, self.ind_bb_zone - 0.25)
+                    if direction == "put":
+                        pos = (c_price - mid) / half_band
+                        if pos < req_zone:
+                            return False, f"البولينجر ({int(pos * 100)}% < {int(req_zone * 100)}%)"
+                    elif direction == "call":
+                        pos = (mid - c_price) / half_band
+                        if pos < req_zone:
+                            return False, f"البولينجر ({int(pos * 100)}% < {int(req_zone * 100)}%)"
+
+        # 3) مؤشر القوة النسبية (RSI)
+        if self.ind_rsi_enabled:
+            rsi = calc_rsi(closes, period=self.ind_rsi_period)
+            if rsi is not None:
+                if direction == "put":
+                    req_ob = self.ind_rsi_overbought if is_pre_close else (self.ind_rsi_overbought - 6.0)
+                    if rsi < req_ob:
+                        return False, f"RSI ({rsi:.1f} < {req_ob:.0f})"
+                elif direction == "call":
+                    req_os = self.ind_rsi_oversold if is_pre_close else (self.ind_rsi_oversold + 6.0)
+                    if rsi > req_os:
+                        return False, f"RSI ({rsi:.1f} > {req_os:.0f})"
+
+        # 4) مؤشر ستوكاستيك (Stochastic 5, 3, 3)
+        if self.ind_stoch_enabled:
+            stoch = calc_stochastic(ordered_candles, k_period=5, smooth=3)
+            if stoch is not None:
+                if direction == "put":
+                    req_s_ob = self.ind_stoch_overbought if is_pre_close else (self.ind_stoch_overbought - 7.0)
+                    if stoch < req_s_ob:
+                        return False, f"Stoch ({stoch:.1f} < {req_s_ob:.0f})"
+                elif direction == "call":
+                    req_s_os = self.ind_stoch_oversold if is_pre_close else (self.ind_stoch_oversold + 7.0)
+                    if stoch > req_s_os:
+                        return False, f"Stoch ({stoch:.1f} > {req_s_os:.0f})"
+
+        # 5) فلتر السيولة (ATR 14)
+        if self.ind_atr_enabled and is_pre_close:
+            atr = calc_atr(ordered_candles, period=14)
+            if atr is not None and atr > 0:
+                c_range = max(h_price - l_price, abs(c_price - o_price))
+                if c_range < (0.25 * atr):
+                    return False, "سيولة ضعيفة جدًا (ATR)"
+                if c_range > (4.0 * atr):
+                    return False, "انفجار سعري مفاجئ (ATR)"
+
+        return True, "مستوفي ✅"
+
+    def get_active_indicators_summary(self) -> str:
+        if not self.indicators_enabled:
+            return "🔴 متوقف (الاعتماد على الشطرنج فقط)"
+        active_list = []
+        if self.ind_bb_enabled:
+            active_list.append(f"BB({int(self.ind_bb_zone * 100)}%)")
+        if self.ind_rsi_enabled:
+            active_list.append(f"RSI({int(self.ind_rsi_oversold)}/{int(self.ind_rsi_overbought)})")
+        if self.ind_wick_enabled:
+            active_list.append("فلتر الذيل")
+        if self.ind_stoch_enabled:
+            active_list.append("Stoch")
+        if self.ind_atr_enabled:
+            active_list.append("ATR")
+        joined = " + ".join(active_list) if active_list else "لا يوجد مؤشر محدد"
+        return f"🟢 مفعّل ({joined})"
 
     # ==========================================
     # إدارة الحسابات المتعددة والتخزين
@@ -479,7 +673,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + إدارة الحسابات
+    # واجهة التحكم (خاص بالأدمن) + قائمة المؤشرات
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -491,6 +685,11 @@ class AboodControlBot:
             {"text": "🧪 الحساب: تجريبي (Demo)", "callback_data": "toggle_account_mode"}
             if self.is_demo_mode
             else {"text": "💵 الحساب: حقيقي (Live) 🔥", "callback_data": "toggle_account_mode"}
+        )
+        ind_master_btn = (
+            {"text": "📊 المؤشرات: مفعّل 🟢", "callback_data": "toggle_indicators_master"}
+            if self.indicators_enabled
+            else {"text": "📊 المؤشرات: متوقف 🔴", "callback_data": "toggle_indicators_master"}
         )
         fast_btn = (
             {"text": "⚡ الوضع السريع: مفعّل 🟢", "callback_data": "toggle_fast_mode"}
@@ -520,6 +719,7 @@ class AboodControlBot:
             "inline_keyboard": [
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
+                [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
                 [{"text": f"🎯 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [
                     {"text": dual_label, "callback_data": "set_dual_pairs"},
@@ -554,6 +754,68 @@ class AboodControlBot:
                 ]
             ]
         }
+
+    def build_indicators_keyboard(self) -> dict:
+        master_btn = (
+            {"text": "🎛 التفعيل العام للمؤشرات: مفعّل 🟢", "callback_data": "ind_toggle_master"}
+            if self.indicators_enabled
+            else {"text": "🎛 التفعيل العام للمؤشرات: متوقف 🔴", "callback_data": "ind_toggle_master"}
+        )
+        bb_btn = (
+            {"text": f"📈 البولينجر باند ({int(self.ind_bb_zone * 100)}%): 🟢", "callback_data": "ind_toggle_bb"}
+            if self.ind_bb_enabled
+            else {"text": "📈 البولينجر باند: 🔴", "callback_data": "ind_toggle_bb"}
+        )
+        rsi_btn = (
+            {"text": f"📉 RSI ({int(self.ind_rsi_oversold)}/{int(self.ind_rsi_overbought)}): 🟢", "callback_data": "ind_toggle_rsi"}
+            if self.ind_rsi_enabled
+            else {"text": "📉 مؤشر RSI: 🔴", "callback_data": "ind_toggle_rsi"}
+        )
+        wick_btn = (
+            {"text": "🕯️ فلتر الجسم والذيل: 🟢", "callback_data": "ind_toggle_wick"}
+            if self.ind_wick_enabled
+            else {"text": "🕯️ فلتر الجسم والذيل: 🔴", "callback_data": "ind_toggle_wick"}
+        )
+        stoch_btn = (
+            {"text": f"⚡ ستوكاستيك ({int(self.ind_stoch_oversold)}/{int(self.ind_stoch_overbought)}): 🟢", "callback_data": "ind_toggle_stoch"}
+            if self.ind_stoch_enabled
+            else {"text": "⚡ ستوكاستيك: 🔴", "callback_data": "ind_toggle_stoch"}
+        )
+        atr_btn = (
+            {"text": "🌊 فلتر السيولة ATR: 🟢", "callback_data": "ind_toggle_atr"}
+            if self.ind_atr_enabled
+            else {"text": "🌊 فلتر السيولة ATR: 🔴", "callback_data": "ind_toggle_atr"}
+        )
+
+        return {
+            "inline_keyboard": [
+                [master_btn],
+                [bb_btn, {"text": "🎚 حساسية BB", "callback_data": "ind_set_bb"}],
+                [rsi_btn, {"text": "🎚 مستويات RSI", "callback_data": "ind_set_rsi"}],
+                [wick_btn, stoch_btn],
+                [atr_btn],
+                [{"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}]
+            ]
+        }
+
+    def format_indicators_menu_text(self) -> str:
+        master_str = "🟢 <b>مفعّل</b> (يتم دمج المؤشرات مع الشطرنج)" if self.indicators_enabled else "🔴 <b>متوقف</b> (الاعتماد على الشطرنج فقط)"
+        return (
+            f"📊 <b>إعدادات المؤشرات والفلاتر المساعدة</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎛 <b>الحالة العامة:</b> {master_str}\n\n"
+            f"• <b>📈 البولينجر باند (20, 2):</b> {'🟢 مفعّل' if self.ind_bb_enabled else '🔴 متوقف'} "
+            f"(نطاق الوصول: <code>{int(self.ind_bb_zone * 100)}%</code>)\n"
+            f"• <b>📉 مؤشر RSI (14):</b> {'🟢 مفعّل' if self.ind_rsi_enabled else '🔴 متوقف'} "
+            f"(شراء ≤ <code>{int(self.ind_rsi_oversold)}</code> | بيع ≥ <code>{int(self.ind_rsi_overbought)}</code>)\n"
+            f"• <b>🕯️ فلتر الجسم والذيل:</b> {'🟢 مفعّل' if self.ind_wick_enabled else '🔴 متوقف'} "
+            f"(يمنع الدوجي والذيل العكسي الطويل)\n"
+            f"• <b>⚡ ستوكاستيك (5,3,3):</b> {'🟢 مفعّل' if self.ind_stoch_enabled else '🔴 متوقف'} "
+            f"(شراء ≤ <code>{int(self.ind_stoch_oversold)}</code> | بيع ≥ <code>{int(self.ind_stoch_overbought)}</code>)\n"
+            f"• <b>🌊 فلتر السيولة ATR (14):</b> {'🟢 مفعّل' if self.ind_atr_enabled else '🔴 متوقف'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>ملاحظة: الشروط مضبوطة بدرجة متوسطة لرفع دقة الإشارات دون تفويت الفرص.</i>"
+        )
 
     def build_accounts_keyboard(self) -> dict:
         rows = []
@@ -667,6 +929,7 @@ class AboodControlBot:
             f"💵 <b>عائد التداول (Turnover):</b> <code>${turnover_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
+            f"📊 <b>المؤشرات والفلاتر:</b> {self.get_active_indicators_summary()}\n"
             f"👯 <b>المزدوج / الصفقات:</b> يمسك <code>{self.max_locked_pairs}</code> عملات | يدخل <code>{self.max_concurrent_trades}</code> صفقات\n"
             f"⚡ <b>الوضع السريع:</b> {fast_status}\n"
             f"🔄 <b>مواصلة النموذج:</b> {cont_status}\n"
@@ -792,6 +1055,57 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "toggle_indicators_master":
+                            self.indicators_enabled = not self.indicators_enabled
+                            log("IND_MASTER", f"حالة المؤشرات والفلاتر: {'مفعّل 🟢' if self.indicators_enabled else 'متوقف 🔴'}")
+                        elif data == "menu_indicators":
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_indicators_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_indicators_keyboard()
+                            })
+                            continue
+                        elif data.startswith("ind_toggle_"):
+                            target = data.replace("ind_toggle_", "")
+                            if target == "master":
+                                self.indicators_enabled = not self.indicators_enabled
+                            elif target == "bb":
+                                self.ind_bb_enabled = not self.ind_bb_enabled
+                            elif target == "rsi":
+                                self.ind_rsi_enabled = not self.ind_rsi_enabled
+                            elif target == "wick":
+                                self.ind_wick_enabled = not self.ind_wick_enabled
+                            elif target == "stoch":
+                                self.ind_stoch_enabled = not self.ind_stoch_enabled
+                            elif target == "atr":
+                                self.ind_atr_enabled = not self.ind_atr_enabled
+
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_indicators_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_indicators_keyboard()
+                            })
+                            continue
+                        elif data == "ind_set_bb":
+                            self.awaiting_input = "IND_BB_ZONE"
+                            await self.send_admin(
+                                "📈 <b>ضبط حساسية البولينجر باند (من 50% إلى 100%):</b>\n"
+                                "• <code>70</code> = متوسط ومتوازن (موصى به)\n"
+                                "• <code>90</code> = صارم (عند ملامسة الخط الخارجي تمامًا)\n"
+                                "أرسل الآن النسبة المطلوبة:"
+                            )
+                            continue
+                        elif data == "ind_set_rsi":
+                            self.awaiting_input = "IND_RSI_LEVELS"
+                            await self.send_admin(
+                                "📉 <b>ضبط مستويات مؤشر RSI (الشراء / البيع):</b>\n"
+                                "أرسل الرقمين مفصولين بمسافة أو شرطة (مثال: <code>38 62</code> للمتوسط، أو <code>30 70</code> للصارم):"
+                            )
+                            continue
                         elif data == "toggle_fast_mode":
                             self.fast_mode = not self.fast_mode
                             log("FAST_MODE", f"حالة الوضع السريع: {'مفعّل 🟢' if self.fast_mode else 'متوقف 🔴'}")
@@ -1057,7 +1371,43 @@ class AboodControlBot:
                             )
                             continue
 
-                        if self.awaiting_input == "DUAL_PAIRS":
+                        if self.awaiting_input == "IND_BB_ZONE":
+                            try:
+                                pct_val = float(text.replace("%", ""))
+                                if 40 <= pct_val <= 110:
+                                    self.ind_bb_zone = pct_val / 100.0
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط حساسية البولينجر باند إلى <b>{int(pct_val)}%</b>.",
+                                        self.build_indicators_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل نسبة بين 40 و 110 (مثال: <code>70</code>):")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقم النسبة فقط (مثال: <code>70</code>):")
+
+                        elif self.awaiting_input == "IND_RSI_LEVELS":
+                            try:
+                                clean_parts = text.replace("-", " ").replace("/", " ").split()
+                                if len(clean_parts) == 2:
+                                    os_val = float(clean_parts[0])
+                                    ob_val = float(clean_parts[1])
+                                    if 10 <= os_val < ob_val <= 90:
+                                        self.ind_rsi_oversold = os_val
+                                        self.ind_rsi_overbought = ob_val
+                                        self.awaiting_input = None
+                                        await self.send_admin(
+                                            f"✅ تم ضبط مستويات RSI إلى: شراء ≤ <b>{int(os_val)}</b> | بيع ≥ <b>{int(ob_val)}</b>.",
+                                            self.build_indicators_keyboard()
+                                        )
+                                    else:
+                                        await self.send_admin("⚠️ تأكد أن الرقم الأول أصغر من الثاني (مثال: <code>38 62</code>):")
+                                else:
+                                    await self.send_admin("⚠️ أرسل رقمين مفصولين بمسافة (مثال: <code>38 62</code>):")
+                            except ValueError:
+                                await self.send_admin("⚠️ صيغة غير صحيحة. أرسل رقمين مثل: <code>38 62</code>:")
+
+                        elif self.awaiting_input == "DUAL_PAIRS":
                             try:
                                 cnt = int(text)
                                 if 1 <= cnt <= 10:
@@ -1322,23 +1672,33 @@ class AboodControlBot:
                 if len(row) >= 3:
                     ts = normalize_ts(row[0])
                     minute_ts = (int(ts) // 60) * 60
-                    self.candles[asset][minute_ts] = {"open": float(row[1]), "close": float(row[2])}
+                    o_p, c_p = float(row[1]), float(row[2])
+                    h_p = float(row[3]) if len(row) >= 5 else max(o_p, c_p)
+                    l_p = float(row[4]) if len(row) >= 5 else min(o_p, c_p)
+                    self.candles[asset][minute_ts] = {"open": o_p, "close": c_p, "high": h_p, "low": l_p}
                 elif len(row) == 2:
                     ts = normalize_ts(row[0])
                     price = float(row[1])
                     minute_ts = (int(ts) // 60) * 60
                     if minute_ts not in tick_buckets:
-                        tick_buckets[minute_ts] = {"open": price, "close": price}
+                        tick_buckets[minute_ts] = {"open": price, "close": price, "high": price, "low": price}
                     else:
                         tick_buckets[minute_ts]["close"] = price
+                        tick_buckets[minute_ts]["high"] = max(tick_buckets[minute_ts]["high"], price)
+                        tick_buckets[minute_ts]["low"] = min(tick_buckets[minute_ts]["low"], price)
             elif isinstance(row, dict) and "time" in row:
                 ts = normalize_ts(row["time"])
                 minute_ts = (int(ts) // 60) * 60
-                self.candles[asset][minute_ts] = {"open": float(row["open"]), "close": float(row["close"])}
+                o_p, c_p = float(row["open"]), float(row["close"])
+                h_p = float(row.get("high", max(o_p, c_p)))
+                l_p = float(row.get("low", min(o_p, c_p)))
+                self.candles[asset][minute_ts] = {"open": o_p, "close": c_p, "high": h_p, "low": l_p}
 
         for m_ts, ohlc in tick_buckets.items():
             if m_ts in self.candles[asset]:
                 self.candles[asset][m_ts]["open"] = ohlc["open"]
+                self.candles[asset][m_ts]["high"] = max(self.candles[asset][m_ts].get("high", ohlc["high"]), ohlc["high"])
+                self.candles[asset][m_ts]["low"] = min(self.candles[asset][m_ts].get("low", ohlc["low"]), ohlc["low"])
             else:
                 self.candles[asset][m_ts] = ohlc
 
@@ -1355,12 +1715,14 @@ class AboodControlBot:
         minute_ts = (int(ts) // 60) * 60
         bucket = self.candles[asset].get(minute_ts)
         if bucket is None:
-            self.candles[asset][minute_ts] = {"open": price, "close": price}
+            self.candles[asset][minute_ts] = {"open": price, "close": price, "high": price, "low": price}
         else:
             bucket["close"] = price
+            bucket["high"] = max(bucket.get("high", price), price)
+            bucket["low"] = min(bucket.get("low", price), price)
 
-        if len(self.candles[asset]) > 120:
-            oldest_keys = sorted(self.candles[asset].keys())[:-100]
+        if len(self.candles[asset]) > 140:
+            oldest_keys = sorted(self.candles[asset].keys())[:-120]
             for k in oldest_keys:
                 del self.candles[asset][k]
 
@@ -1535,7 +1897,6 @@ class AboodControlBot:
 
             server_now = self.get_server_now()
 
-            # حساب أقرب موعد إغلاق (سواء لصفقة نشطة أو لأزواج ممسوكة في قائمة الانتظار)
             deadlines = []
             if self.active_trades:
                 deadlines.append(min(t["close_ts"] for t in self.active_trades))
@@ -1720,7 +2081,7 @@ class AboodControlBot:
                             )
 
             # ========================================================
-            # 2) فحص الأزواج المجهّزة في قائمة الانتظار (المزدوج / الوضع السريع)
+            # 2) فحص الأزواج المجهّزة في قائمة الانتظار (المزدوج / الوضع السريع + المؤشرات)
             # ========================================================
             if self.locked_candidates:
                 earliest_minute = min(c["target_minute"] for c in self.locked_candidates)
@@ -1776,18 +2137,25 @@ class AboodControlBot:
                             (direction == "call" and live_color == "RED")
                         )
 
+                        # التحقق الإضافي من المؤشرات والفلاتر إذا كانت مفعّلة
+                        ind_ok, ind_reason = (True, "متوقف")
+                        if condition_met and self.indicators_enabled:
+                            ind_ok, ind_reason = self.check_indicators(asset, direction, is_pre_close=True)
+
                         log(
                             "PRE_CLOSE",
                             f"⏱ فحص [#{rank}] قبل الإغلاق بـ {max(0.0, cand_remaining):.3f}ث | {asset} | "
-                            f"{color_label(live_color)} => {'مطابق ✅' if condition_met else 'مخالف ❌'}"
+                            f"{color_label(live_color)} | المؤشرات: {ind_reason} => "
+                            f"{'دخول ✅' if (condition_met and ind_ok) else 'إلغاء ❌'}"
                         )
 
-                        if condition_met:
+                        if condition_met and ind_ok:
                             selected_to_enter.append(cand)
                         else:
+                            cancel_note = f" ({ind_reason})" if (condition_met and not ind_ok) else ""
                             self.enqueue_signal_reply(
                                 sig_uid,
-                                f"⚪ <b>تم إلغاء الإشارة</b>\n"
+                                f"⚪ <b>تم إلغاء الإشارة{cancel_note}</b>\n"
                                 f"🏛 <code>{sig_sym}</code>"
                             )
 
@@ -1847,8 +2215,6 @@ class AboodControlBot:
 
         self.print_five_candles(asset, force=force_print)
 
-        # في الوضع العادي: نلتقط الفرص فقط إذا لم تكن هناك صفقات نشطة
-        # في الوضع السريع (fast_mode): نلتقط الفرص حتى أثناء وجود صفقات نشطة والتدبيل
         can_capture_more = (
             len(self.locked_candidates) < self.max_locked_pairs
             and (self.fast_mode or not self.active_trades)
@@ -1875,6 +2241,15 @@ class AboodControlBot:
 
             # شرط البيع: أحمر -> أحمر -> أخضر -> أحمر
             if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
+                if self.indicators_enabled:
+                    ind_ok, ind_reason = self.check_indicators(asset, "put", is_pre_close=False)
+                    if not ind_ok:
+                        skip_sig = (m_open, "put", ind_reason)
+                        if self.last_ind_skip_log.get(asset) != skip_sig:
+                            self.last_ind_skip_log[asset] = skip_sig
+                            log("IND_FILTER", f"📊 تخطي نموذج بيع على {sig_sym} بسبب المؤشرات: {ind_reason}")
+                        return
+
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                     f"{priority_line}"
@@ -1903,6 +2278,15 @@ class AboodControlBot:
 
             # شرط الشراء: أخضر -> أخضر -> أحمر -> أخضر
             elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
+                if self.indicators_enabled:
+                    ind_ok, ind_reason = self.check_indicators(asset, "call", is_pre_close=False)
+                    if not ind_ok:
+                        skip_sig = (m_open, "call", ind_reason)
+                        if self.last_ind_skip_log.get(asset) != skip_sig:
+                            self.last_ind_skip_log[asset] = skip_sig
+                            log("IND_FILTER", f"📊 تخطي نموذج شراء على {sig_sym} بسبب المؤشرات: {ind_reason}")
+                        return
+
                 signal_msg = (
                     f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                     f"{priority_line}"
@@ -2024,7 +2408,6 @@ class AboodControlBot:
                 await asyncio.sleep(1)
                 continue
 
-            # في الوضع العادي (غير السريع): إذا كنا داخل صفقة نركز على أزواج الصفقات المفتوحة فقط
             if not self.fast_mode and self.active_trades:
                 trade_assets = list(dict.fromkeys(t["asset"] for t in self.active_trades))
                 pair = trade_assets[focus_idx % len(trade_assets)]
@@ -2037,7 +2420,6 @@ class AboodControlBot:
                 await asyncio.sleep(0.8 if len(trade_assets) > 1 else 2.0)
                 continue
 
-            # إذا اكتمل الحد الأقصى للمزدوج (سواء في الوضع السريع أو العادي) نركز على الأزواج الممسوكة حتى الإغلاق
             if len(self.locked_candidates) >= self.max_locked_pairs:
                 cand_assets = [c["asset"] for c in self.locked_candidates]
                 pair = cand_assets[focus_idx % len(cand_assets)]
@@ -2060,7 +2442,6 @@ class AboodControlBot:
             pair = active_pairs[idx % len(active_pairs)]
             idx += 1
 
-            # تخطي الأزواج الممسوكة مسبقًا أو التي بها صفقات نشطة حاليًا
             if pair in locked_assets or pair in active_assets:
                 await asyncio.sleep(0.05)
                 continue
@@ -2083,11 +2464,12 @@ class AboodControlBot:
             try:
                 log("SCAN", f"--- فحص [{self.get_scope_label()}]: {pair} ({payout}%) ---")
                 await ws.send(f'42["changeSymbol",{{"asset":"{pair}","period":60}}]')
+                # سحب 60 شمعة (3600 ثانية) لتغذية البولينجر باند والـ RSI والـ ATR بدقة
                 history_req = {
                     "asset": pair,
                     "index": self.req_index,
                     "time": now_ts,
-                    "offset": 900,
+                    "offset": 3600,
                     "period": 60
                 }
                 await ws.send(f'42["loadHistoryPeriod",{json.dumps(history_req)}]')
