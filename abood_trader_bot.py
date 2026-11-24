@@ -2,9 +2,11 @@ import asyncio
 import inspect
 import json
 import os
+import secrets
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 import websockets
@@ -18,6 +20,9 @@ if sys.stdout.encoding != "utf-8":
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
+
+# رابط الاستضافة العام على Render (يُقرأ تلقائيًا من Render أو من الرابط الافتراضي)
+PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://abood-trader.onrender.com").rstrip("/")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
 DEFAULT_LEAD_SECONDS = 0.1
@@ -115,6 +120,22 @@ def parse_auth_frame(frame: str) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def make_auth_frame(session_str: str, uid_val: str | int, is_demo: bool) -> str:
+    try:
+        uid_clean = int(uid_val)
+    except (ValueError, TypeError):
+        uid_clean = str(uid_val)
+    payload = {
+        "session": str(session_str).strip(),
+        "isDemo": 1 if is_demo else 0,
+        "uid": uid_clean,
+        "platform": 2,
+        "isFastHistory": True,
+        "isOptimized": True
+    }
+    return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
 
 
 def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
@@ -224,11 +245,12 @@ class AboodControlBot:
         self.ind_atr_enabled = False
         self.last_ind_skip_log = {}
 
-        # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
+        # إدارة الحسابات ووضع التداول (تجريبي / حقيقي) + رمز الأمان لبوابة الهاتف
         self.accounts = []
         self.active_account_idx = 0
         self.is_demo_mode = True
         self.auth_frame = DEFAULT_AUTH_FRAME
+        self.web_connect_token = ""
         self.temp_new_acc_name = ""
         self._load_accounts_storage()
 
@@ -236,16 +258,16 @@ class AboodControlBot:
         # نظام التعزيز الذكي (يُطبَّق على الصفقات الجديدة فقط دون المساس بالصفقات الجارية)
         # ==========================================
         self.boost_enabled = False
-        self.boost_mode = "CAPITAL"          # "CAPITAL" = تعويض رأس المال للقمة | "TRADES" = عدد صفقات ناجحة محددة
-        self.boost_increment = 10.0          # مقدار الزيادة الواحدة على المبلغ الأساسي عند الخسارة
-        self.boost_target_wins = 5           # عدد الصفقات الناجحة المطلوبة في وضع "TRADES"
-        self.boost_wins_done = 0             # عداد الصفقات الناجحة المنجزة أثناء التعزيز
-        self.effective_base_amount = 10.0    # المبلغ الأساسي العامل للصفقات الجديدة حاليًا
-        self.in_boost_recovery = False       # هل التعزيز نشط حاليًا بعد خسارة؟
-        self.peak_balance = None             # أعلى قمة وصل إليها رأس المال قبل الخسارة
+        self.boost_mode = "CAPITAL"
+        self.boost_increment = 10.0
+        self.boost_target_wins = 5
+        self.boost_wins_done = 0
+        self.effective_base_amount = 10.0
+        self.in_boost_recovery = False
+        self.peak_balance = None
         self.current_cycle_spent = 0.0
 
-        # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول (متوقف افتراضيًا)
+        # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول
         self.continuation_enabled = False
 
         # نطاق المسح
@@ -285,7 +307,7 @@ class AboodControlBot:
         self.active_trades = []
         self.trade_seq = 0
         self.global_step_index = 0
-        self.pending_martingale_steps = []   # عناصر بصيغة: (next_g_idx, cycle_base)
+        self.pending_martingale_steps = []
 
         # سجل الإحصائيات اليومية + عائد التداول (Turnover)
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
@@ -397,8 +419,22 @@ class AboodControlBot:
         return f"🟢 مفعّل ({joined})"
 
     # ==========================================
-    # إدارة الحسابات المتعددة والتخزين
+    # إدارة الحسابات المتعددة والتخزين (ديمو + حقيقي لكل حساب)
     # ==========================================
+    def _normalize_account_record(self, acc: dict) -> dict:
+        base_frame = acc.get("demo_auth_frame") or acc.get("live_auth_frame") or acc.get("auth_frame") or DEFAULT_AUTH_FRAME
+        parsed = parse_auth_frame(base_frame) or {}
+        uid = str(acc.get("uid") or parsed.get("uid") or "000000")
+        demo_f = acc.get("demo_auth_frame") or build_auth_frame_with_mode(base_frame, True)
+        live_f = acc.get("live_auth_frame") or build_auth_frame_with_mode(base_frame, False)
+        return {
+            "name": acc.get("name", f"حساب {uid}"),
+            "uid": uid,
+            "demo_auth_frame": demo_f,
+            "live_auth_frame": live_f,
+            "auth_frame": demo_f
+        }
+
     def _load_accounts_storage(self):
         loaded = False
         if os.path.exists(ACCOUNTS_FILE):
@@ -406,22 +442,26 @@ class AboodControlBot:
                 with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict) and data.get("accounts"):
-                    self.accounts = data["accounts"]
+                    self.accounts = [self._normalize_account_record(a) for a in data["accounts"]]
                     self.active_account_idx = min(int(data.get("active_idx", 0)), len(self.accounts) - 1)
                     self.is_demo_mode = bool(data.get("is_demo_mode", True))
+                    self.web_connect_token = str(data.get("web_token", "")).strip()
                     loaded = True
             except Exception as e:
                 log("ACC_WARN", f"تعذر قراءة ملف الحسابات: {e}")
+
+        if not self.web_connect_token:
+            self.web_connect_token = secrets.token_urlsafe(16)
 
         if not loaded or not self.accounts:
             parsed = parse_auth_frame(DEFAULT_AUTH_FRAME) or {}
             uid = str(parsed.get("uid", "142271281"))
             self.is_demo_mode = bool(parsed.get("isDemo", 1) == 1)
-            self.accounts = [{
+            self.accounts = [self._normalize_account_record({
                 "name": "الحساب الافتراضي",
                 "uid": uid,
                 "auth_frame": DEFAULT_AUTH_FRAME
-            }]
+            })]
             self.active_account_idx = 0
             self._save_accounts_storage()
 
@@ -433,6 +473,7 @@ class AboodControlBot:
                 json.dump({
                     "active_idx": self.active_account_idx,
                     "is_demo_mode": self.is_demo_mode,
+                    "web_token": self.web_connect_token,
                     "accounts": self.accounts
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -442,16 +483,64 @@ class AboodControlBot:
         if not self.accounts:
             return
         self.active_account_idx = max(0, min(self.active_account_idx, len(self.accounts) - 1))
-        raw_frame = self.accounts[self.active_account_idx]["auth_frame"]
-        self.auth_frame = build_auth_frame_with_mode(raw_frame, self.is_demo_mode)
+        acc = self.accounts[self.active_account_idx]
+        if self.is_demo_mode:
+            self.auth_frame = acc.get("demo_auth_frame") or build_auth_frame_with_mode(acc["auth_frame"], True)
+        else:
+            self.auth_frame = acc.get("live_auth_frame") or build_auth_frame_with_mode(acc["auth_frame"], False)
 
     def get_active_account(self) -> dict:
         if not self.accounts:
             return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame}
         return self.accounts[self.active_account_idx]
 
+    def get_mobile_connect_url(self, acc_name: str = "") -> str:
+        url = f"{PUBLIC_BASE_URL}/connect?token={quote(self.web_connect_token)}"
+        if acc_name:
+            url += f"&name={quote(acc_name)}"
+        return url
+
+    def register_captured_account(self, name: str, uid: str, demo_session: str, live_session: str) -> dict:
+        """حفظ أو تحديث حساب تم التقاطه من الهاتف (يشمل جلسة الديمو والحقيقي معًا)"""
+        clean_uid = str(uid).strip() or "Unknown"
+        clean_name = (name or "").strip()[:30] or f"حساب {clean_uid}"
+
+        # إذا لم يتوفر إلا أحد الرمزين، نستخدم المتوفر لكليهما مع تغيير isDemo
+        s_demo = (demo_session or live_session or "").strip()
+        s_live = (live_session or demo_session or "").strip()
+
+        demo_frame = make_auth_frame(s_demo, clean_uid, is_demo=True)
+        live_frame = make_auth_frame(s_live, clean_uid, is_demo=False)
+
+        # إذا كان الحساب بنفس الـ UID محفوظًا مسبقًا -> نحدّث جلساته مباشرة
+        existing_idx = None
+        for idx, acc in enumerate(self.accounts):
+            if str(acc.get("uid")) == clean_uid:
+                existing_idx = idx
+                break
+
+        record = {
+            "name": clean_name,
+            "uid": clean_uid,
+            "demo_auth_frame": demo_frame,
+            "live_auth_frame": live_frame,
+            "auth_frame": demo_frame
+        }
+
+        if existing_idx is not None:
+            self.accounts[existing_idx] = record
+            self.active_account_idx = existing_idx
+        else:
+            self.accounts.append(record)
+            self.active_account_idx = len(self.accounts) - 1
+
+        self.account_balance = None
+        self.reset_boost_state(reset_peak=True)
+        self._sync_active_auth_frame()
+        self._save_accounts_storage()
+        return record
+
     def reset_boost_state(self, reset_peak: bool = False):
-        """إعادة ضبط حالة التعزيز والعودة للمبلغ الأساسي الأصلي"""
         self.in_boost_recovery = False
         self.boost_wins_done = 0
         self.current_cycle_spent = 0.0
@@ -609,7 +698,6 @@ class AboodControlBot:
         return symbol.replace("_otc", "-OTC").replace("#", "")
 
     def get_current_entry_base(self) -> float:
-        """المبلغ الأساسي للصفقات الجديدة فقط (يأخذ التعزيز إن كان نشطًا، وإلا الأساسي الأصلي)"""
         if self.boost_enabled and self.in_boost_recovery:
             return self.effective_base_amount
         return self.base_amount
@@ -671,7 +759,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + قائمة المؤشرات + قائمة التعزيز
+    # واجهة التحكم (خاص بالأدمن) + إدارة الحسابات
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -879,12 +967,16 @@ class AboodControlBot:
         for idx, acc in enumerate(self.accounts):
             prefix = "✅ " if idx == self.active_account_idx else "👤 "
             rows.append([{
-                "text": f"{prefix}{acc['name']} ({acc['uid']})",
+                "text": f"{prefix}{acc['name']} ({acc['uid']}) [Demo+Live]",
                 "callback_data": f"select_acc_{idx}"
             }])
 
+        rows.append([{
+            "text": "📱 إضافة حساب من الهاتف (تسجيل دخول مباشر)",
+            "url": self.get_mobile_connect_url()
+        }])
         rows.append([
-            {"text": "➕ إضافة حساب جديد", "callback_data": "add_account_start"},
+            {"text": "⌨️ إضافة يدوية بالجلسة", "callback_data": "add_account_start"},
             {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
         ])
         rows.append([
@@ -1298,7 +1390,8 @@ class AboodControlBot:
                                     f"👤 <b>إدارة حسابات Pocket Option</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
                                     f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
-                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n\n"
+                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n"
+                                    f"🔹 <b>ربط الهاتف المباشر:</b> متاح للأندرويد والآيفون (يلتقط الديمو والحقيقي والـ UID تلقائيًا) 📱\n\n"
                                     f"اختر حسابًا للتبديل إليه فورًا أو أضف حسابًا جديدًا:"
                                 ),
                                 "parse_mode": "HTML",
@@ -1324,8 +1417,8 @@ class AboodControlBot:
                         elif data == "add_account_start":
                             self.awaiting_input = "ADD_ACC_NAME"
                             await self.send_admin(
-                                "👤 <b>إضافة حساب جديد — الخطوة 1 من 2:</b>\n"
-                                "أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code> أو <code>حساب VIP</code>):"
+                                "👤 <b>إضافة حساب يدويًا — الخطوة 1 من 2:</b>\n"
+                                "أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>):"
                             )
                             continue
                         elif data == "menu_delete_account":
@@ -1595,21 +1688,12 @@ class AboodControlBot:
                             parsed = parse_auth_frame(text)
                             if parsed is not None:
                                 uid = str(parsed.get("uid", "Unknown"))
-                                new_acc = {
-                                    "name": self.temp_new_acc_name,
-                                    "uid": uid,
-                                    "auth_frame": text.strip()
-                                }
-                                self.accounts.append(new_acc)
-                                self.active_account_idx = len(self.accounts) - 1
-                                self.account_balance = None
-                                self.reset_boost_state(reset_peak=True)
-                                self._sync_active_auth_frame()
-                                self._save_accounts_storage()
+                                sess = str(parsed.get("session", ""))
+                                new_acc = self.register_captured_account(self.temp_new_acc_name, uid, sess, sess)
                                 self.awaiting_input = None
                                 self.full_reset_to_scanning("إضافة وتفعيل حساب جديد")
                                 await self.send_admin(
-                                    f"✅ <b>تم حفظ وتفعيل الحساب بنجاح!</b>\n"
+                                    f"✅ <b>تم حفظ وتفعيل الحساب بنجاح (Demo + Live)!</b>\n"
                                     f"👤 <b>الاسم:</b> {new_acc['name']}\n"
                                     f"🆔 <b>الآيدي (UID):</b> <code>{uid}</code>",
                                     self.build_main_keyboard()
@@ -1713,15 +1797,12 @@ class AboodControlBot:
                             parsed = parse_auth_frame(text)
                             if parsed is not None:
                                 uid = str(parsed.get("uid", self.get_active_account()["uid"]))
-                                self.accounts[self.active_account_idx]["auth_frame"] = text.strip()
-                                self.accounts[self.active_account_idx]["uid"] = uid
-                                self.account_balance = None
-                                self.reset_boost_state(reset_peak=True)
-                                self._sync_active_auth_frame()
-                                self._save_accounts_storage()
+                                sess = str(parsed.get("session", ""))
+                                curr_name = self.get_active_account()["name"]
+                                self.register_captured_account(curr_name, uid, sess, sess)
                                 self.awaiting_input = None
                                 await self.send_admin(
-                                    f"✅ تم تحديث جلسة الحساب <b>{self.get_active_account()['name']}</b> (<code>{uid}</code>). جاري إعادة الاتصال...",
+                                    f"✅ تم تحديث جلسة الحساب <b>{curr_name}</b> (<code>{uid}</code>) للديمو والحقيقي. جاري إعادة الاتصال...",
                                     self.build_main_keyboard()
                                 )
                                 if self.ws:
@@ -1928,7 +2009,6 @@ class AboodControlBot:
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
-        # إذا لم يُمرَّر أساس دورة سابقة -> فهذه صفقة جديدة وتبدأ بالأساسي الحالي (المعزّز إن كان نشطًا)
         if cycle_base is None:
             cycle_base = self.get_current_entry_base()
 
@@ -1979,7 +2059,7 @@ class AboodControlBot:
             "entry_price": entry_price,
             "price_confirmed": False,
             "amount": amount,
-            "cycle_base": cycle_base,   # حفظ المبلغ الأساسي الخاص بهذه الدورة حتى نهايتها
+            "cycle_base": cycle_base,
             "signal_uid": signal_uid,
             "is_cont": is_cont_entry,
         }
@@ -2106,7 +2186,6 @@ class AboodControlBot:
                             self.global_step_index = 0
                         self.current_cycle_spent = 0.0
 
-                        # متابعة تقدم التعزيز عند الربح
                         if self.boost_enabled and self.in_boost_recovery:
                             if self.boost_mode == "TRADES":
                                 self.boost_wins_done += 1
@@ -2135,7 +2214,6 @@ class AboodControlBot:
                                     else:
                                         log("BOOST_PROG", f"🛡️ تقدم التعزيز نحو القمة: المتوقع ${format_money(projected_bal)} / الهدف ${format_money(self.peak_balance)}")
 
-                        # تفعيل مواصلة النموذج (تُعامل كصفقة جديدة فتأخذ الأساسي الحالي أو المعزّز)
                         if self.continuation_enabled and attempt_num == 1 and not is_cont:
                             eligible, _ = self.is_pair_eligible(asset)
                             if eligible:
@@ -2153,7 +2231,7 @@ class AboodControlBot:
                                 )
                         continue
 
-                    # ب) حالة التعادل (DRAW) — إعادة الدخول بنفس المبلغ الأساسي للدورة الجارية
+                    # ب) حالة التعادل (DRAW)
                     if result == "DRAW":
                         self.current_cycle_spent -= won_amount
                         log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ (${won_amount}) دون تدبيل.")
@@ -2181,7 +2259,6 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # زيادة التعزيز مرة واحدة فقط للصفقات الجديدة القادمة
                         if self.boost_enabled and not self.in_boost_recovery:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
@@ -2206,7 +2283,6 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # تفعيل التعزيز مرة واحدة فقط للصفقات الجديدة عند خسارة الدورة
                         if self.boost_enabled and not self.in_boost_recovery:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
@@ -2218,7 +2294,6 @@ class AboodControlBot:
                         self.current_cycle_spent = 0.0
                         self.global_step_index = 0
                         if next_p_idx < self.pair_steps:
-                            # بداية دورة جديدة (g_idx=0) -> تأخذ الأساسي الجديد (المعزّز)
                             await self.open_trade(
                                 asset, direction,
                                 g_idx=0, p_idx=next_p_idx,
@@ -2228,7 +2303,6 @@ class AboodControlBot:
                             )
                     else:
                         if next_p_idx < self.pair_steps:
-                            # استمرار التدبيل لنفس الصفقة الجارية -> تحافظ على cycle_base الأصلي للدورة!
                             self.global_step_index = next_g_idx
                             await self.open_trade(
                                 asset, direction,
@@ -2239,7 +2313,6 @@ class AboodControlBot:
                                 cycle_base=trade_cycle_base
                             )
                         else:
-                            # ترحيل خطوة التدبيل للزوج القادم مع الحفاظ على أساس دورتها الأصلي
                             self.global_step_index = next_g_idx
                             self.pending_martingale_steps.append((next_g_idx, trade_cycle_base))
                             log(
@@ -2248,7 +2321,7 @@ class AboodControlBot:
                             )
 
             # ========================================================
-            # 2) فحص الأزواج المجهّزة في قائمة الانتظار (المزدوج / الوضع السريع + المؤشرات)
+            # 2) فحص الأزواج المجهّزة في قائمة الانتظار
             # ========================================================
             if self.locked_candidates:
                 earliest_minute = min(c["target_minute"] for c in self.locked_candidates)
@@ -2342,10 +2415,10 @@ class AboodControlBot:
                                     step_to_use, carried_base = self.pending_martingale_steps.pop(0)
                                 elif not any(t["g_idx"] > 0 for t in self.active_trades):
                                     step_to_use = self.global_step_index
-                                    carried_base = None  # صفقة جديدة تبدأ بالتعزيز إن كان مفعّلاً
+                                    carried_base = None
                                 else:
                                     step_to_use = 0
-                                    carried_base = None  # صفقة جديدة تبدأ بالتعزيز إن كان مفعّلاً
+                                    carried_base = None
                             else:
                                 step_to_use = 0
                                 carried_base = None
@@ -2527,7 +2600,6 @@ class AboodControlBot:
                 mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
                 log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${format_money(new_bal)}")
 
-                # تحديث قمة رأس المال والتحقق من اكتمال تعويض القمة
                 if self.peak_balance is None:
                     self.peak_balance = new_bal
                 elif new_bal >= self.peak_balance:
@@ -2688,23 +2760,225 @@ class AboodControlBot:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
-    # خادم الويب المدمج لإبقاء الاستضافة المجانية على Render نشطة 24/7
+    # بوابة الويب المدمجة للهواتف (أندرويد / آيفون) + مراقبة Render 24/7
     # ==========================================
+    def render_mobile_connect_html(self, prefill_name: str = "") -> str:
+        safe_name = prefill_name.replace('"', "").replace("<", "").replace(">", "")
+        token_js = json.dumps(self.web_connect_token)
+        base_url_js = json.dumps(PUBLIC_BASE_URL)
+        prefill_js = json.dumps(safe_name)
+
+        return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ربط حساب عبود تريدينج</title>
+<style>
+  * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+  body {{ margin: 0; padding: 16px; background: #0b1120; color: #f8fafc; }}
+  .card {{ max-width: 480px; margin: 0 auto; background: #131c31; border: 1px solid #1e293b; border-radius: 18px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
+  h2 {{ margin: 0 0 6px; font-size: 20px; color: #10b981; text-align: center; }}
+  p.sub {{ margin: 0 0 18px; font-size: 13px; color: #94a3b8; text-align: center; line-height: 1.5; }}
+  .step {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 14px; }}
+  .step-title {{ font-weight: 700; font-size: 14px; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }}
+  input, textarea {{ width: 100%; background: #1e293b; border: 1px solid #334155; color: #fff; padding: 11px 12px; border-radius: 10px; font-size: 14px; outline: none; }}
+  input:focus, textarea:focus {{ border-color: #10b981; }}
+  .btn {{ display: block; width: 100%; text-align: center; padding: 13px; border-radius: 11px; font-weight: 700; font-size: 14px; text-decoration: none; border: none; cursor: pointer; margin-top: 8px; }}
+  .btn-primary {{ background: linear-gradient(135deg, #10b981, #059669); color: #fff; }}
+  .btn-blue {{ background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }}
+  .btn-amber {{ background: linear-gradient(135deg, #f59e0b, #d97706); color: #0b1120; }}
+  .hint {{ font-size: 12px; color: #cbd5e1; line-height: 1.6; margin-top: 8px; }}
+  .badge {{ display: inline-block; background: #064e3b; color: #6ee7b7; padding: 2px 8px; border-radius: 6px; font-size: 11px; }}
+  .toast {{ display: none; background: #065f46; color: #ecfdf5; padding: 10px; border-radius: 8px; text-align: center; font-size: 13px; margin-top: 8px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>🛡 ربط حساب Pocket Option</h2>
+  <p class="sub">ربط مباشر من هاتفك (أندرويد / آيفون) بدون لابتوب<br><span class="badge">يلتقط الديمو + الحقيقي + الآيدي تلقائيًا</span></p>
+
+  <div class="step">
+    <div class="step-title">1️⃣ أدخل اسمًا للحساب</div>
+    <input type="text" id="accName" placeholder="مثال: حسابي الرئيسي" value="">
+  </div>
+
+  <div class="step">
+    <div class="step-title">2️⃣ سجّل الدخول بحسابك في Pocket Option</div>
+    <p class="hint">افتح صفحة تسجيل الدخول، أدخل بريدك وكلمة المرور حتى تفتح لك واجهة التداول والشموع:</p>
+    <a href="https://pocketoption.com/en/login/" target="_blank" class="btn btn-blue">🌐 فتح تسجيل الدخول في Pocket Option</a>
+  </div>
+
+  <div class="step">
+    <div class="step-title">3️⃣ التقط جلسة الديمو والحقيقي بضغطة واحدة</div>
+    <p class="hint">بعد فتح واجهة التداول في المتصفح، اضغط نسخ أداة الالتقاط الذكية ثم شغّلها في شريط عنوان المتصفح (أو احفظها كمفضلة واضغط عليها):</p>
+    <button class="btn btn-amber" onclick="copySmartExtractor()">📋 نسخ أداة الالتقاط الذكية (Demo + Live)</button>
+    <a id="bookmarkletLink" href="#" class="btn btn-primary" style="margin-top:8px;">⚡ أداة الالتقاط السريع (اسحبها للمفضلة)</a>
+    <div id="copyToast" class="toast">✅ تم نسخ الأداة! اذهب الآن لصفحة Pocket Option، الصقها في شريط العنوان واكتب في أولها <b>javascript:</b> ثم اضغط ذهاب.</div>
+  </div>
+
+  <div class="step">
+    <div class="step-title">🔄 أو الصق كود الجلسة هنا مباشرة</div>
+    <form method="POST" action="/api/manual_web_capture">
+      <input type="hidden" name="token" value="{self.web_connect_token}">
+      <input type="hidden" name="name" id="hiddenFormName" value="">
+      <textarea name="raw_session" rows="2" placeholder='الصق هنا 42["auth",...] أو رمز session'></textarea>
+      <button type="submit" class="btn btn-primary" onclick="document.getElementById('hiddenFormName').value=document.getElementById('accName').value;">✅ حفظ وتفعيل الحساب فورًا</button>
+    </form>
+  </div>
+</div>
+
+<script>
+  const TOKEN = {token_js};
+  const BASE_URL = {base_url_js};
+  const PREFILL = {prefill_js};
+  const nameInput = document.getElementById('accName');
+  if (PREFILL) nameInput.value = PREFILL;
+
+  function buildExtractorCode() {{
+    const nm = encodeURIComponent(nameInput.value.trim() || 'حساب الهاتف');
+    const js = `(async function(){{try{{alert('⏳ جاري التقاط جلسة الديمو والحقيقي والآيدي...');let h=document.documentElement.innerHTML;let u=(h.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/)||[])[1]||'';let ds=(h.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/)||[])[1]||'';let ls=ds;try{{let r1=await fetch('/en/cabinet/demo-quick-high-low/',{{credentials:'include'}});let t1=await r1.text();let m1=t1.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/);let u1=t1.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/);if(m1)ds=m1[1];if(u1)u=u1[1];}}catch(e){{}}try{{let r2=await fetch('/en/cabinet/quick-high-low/',{{credentials:'include'}});let t2=await r2.text();let m2=t2.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/);let u2=t2.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/);if(m2)ls=m2[1];if(!u&&u2)u=u2[1];}}catch(e){{}}if(!ds&&!ls){{alert('⚠️ لم يتم العثور على الجلسة! تأكد أنك سجلت الدخول وفتحت صفحة التداول.');return;}}location.href='${{BASE_URL}}/api/mobile_capture_redirect?token=${{encodeURIComponent(TOKEN)}}&name=${{nm}}&uid='+encodeURIComponent(u)+'&demo_s='+encodeURIComponent(ds)+'&live_s='+encodeURIComponent(ls);}}catch(err){{alert('خطأ: '+err);}}}})();`;
+    return 'javascript:' + js;
+  }}
+
+  function refreshLinks() {{
+    document.getElementById('bookmarkletLink').href = buildExtractorCode();
+  }}
+  nameInput.addEventListener('input', refreshLinks);
+  refreshLinks();
+
+  function copySmartExtractor() {{
+    const code = buildExtractorCode();
+    navigator.clipboard.writeText(code).then(() => {{
+      const t = document.getElementById('copyToast');
+      t.style.display = 'block';
+    }}).catch(() => {{
+      prompt('انسخ هذا الكود بالكامل:', code);
+    }});
+  }}
+</script>
+</body>
+</html>"""
+
+    def render_success_html(self, acc: dict) -> str:
+        return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>تم الربط بنجاح</title>
+<style>
+  body {{ margin: 0; padding: 24px; background: #0b1120; color: #f8fafc; font-family: sans-serif; text-align: center; }}
+  .box {{ max-width: 420px; margin: 40px auto; background: #131c31; border: 1px solid #10b981; border-radius: 18px; padding: 26px; }}
+  h2 {{ color: #10b981; margin-top: 0; }}
+  .info {{ background: #0f172a; padding: 14px; border-radius: 12px; margin: 16px 0; font-size: 14px; line-height: 1.8; }}
+  .btn {{ display: inline-block; background: #10b981; color: #fff; padding: 12px 24px; border-radius: 10px; text-decoration: none; font-weight: 700; }}
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>✅ تم ربط الحساب بنجاح!</h2>
+  <div class="info">
+    👤 <b>اسم الحساب:</b> {acc['name']}<br>
+    🆔 <b>الآيدي (UID):</b> {acc['uid']}<br>
+    🧪 <b>جلسة الديمو:</b> جاهزة ✅<br>
+    💵 <b>جلسة الحقيقي:</b> جاهزة ✅
+  </div>
+  <p style="color:#94a3b8;font-size:13px;">تم حفظ الحساب وتفعيله في البوت تلقائيًا. يمكنك الآن العودة إلى تليجرام والتبديل بين الديمو والحقيقي بحرية.</p>
+  <a href="https://t.me/" class="btn">🔙 العودة إلى تليجرام</a>
+</div>
+</body>
+</html>"""
+
     async def start_keepalive_web_server(self):
         async def health_handler(request):
             status = "RUNNING" if self.is_running else "PAUSED"
             return web.Response(text=f"Abood Auto Trader Bot is alive! Status: {status}")
 
+        async def connect_page_handler(request):
+            token = request.query.get("token", "")
+            if token != self.web_connect_token:
+                return web.Response(text="⛔ رابط غير صالح أو منتهي الصلاحية. افتح الرابط من داخل بوت تليجرام.", status=403)
+            prefill = request.query.get("name", "")
+            return web.Response(text=self.render_mobile_connect_html(prefill), content_type="text/html", charset="utf-8")
+
+        async def mobile_capture_redirect_handler(request):
+            token = request.query.get("token", "")
+            if token != self.web_connect_token:
+                return web.Response(text="⛔ غير مصرح.", status=403)
+
+            name = request.query.get("name", "حساب الهاتف")
+            uid = request.query.get("uid", "").strip()
+            demo_s = request.query.get("demo_s", "").strip()
+            live_s = request.query.get("live_s", "").strip()
+
+            if not demo_s and not live_s:
+                return web.Response(text="⚠️ لم يتم استلام بيانات الجلسة.", status=400)
+
+            acc = self.register_captured_account(name, uid or "Unknown", demo_s, live_s)
+            self.full_reset_to_scanning("ربط حساب جديد من الهاتف")
+            log("MOBILE_AUTH", f"📱 تم ربط الحساب من الهاتف: {acc['name']} (UID: {acc['uid']}) [Demo+Live]")
+
+            asyncio.create_task(self.send_admin(
+                f"📱 <b>تم ربط حساب جديد من الهاتف بنجاح!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>الاسم:</b> {acc['name']}\n"
+                f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
+                f"🧪 <b>الديمو (Demo):</b> جاهز ✅\n"
+                f"💵 <b>الحقيقي (Live):</b> جاهز ✅\n\n"
+                f"تم تفعيل الحساب تلقائيًا؛ يمكنك التبديل بين التجريبي والحقيقي من القائمة الرئيسية.",
+                self.build_main_keyboard()
+            ))
+
+            if self.ws:
+                asyncio.create_task(self.ws.close())
+
+            return web.Response(text=self.render_success_html(acc), content_type="text/html", charset="utf-8")
+
+        async def manual_web_capture_handler(request):
+            data = await request.post()
+            token = str(data.get("token", ""))
+            if token != self.web_connect_token:
+                return web.Response(text="⛔ غير مصرح.", status=403)
+
+            name = str(data.get("name", "حساب الهاتف")).strip() or "حساب الهاتف"
+            raw = str(data.get("raw_session", "")).strip()
+            parsed = parse_auth_frame(raw)
+            if parsed is not None:
+                uid = str(parsed.get("uid", "Unknown"))
+                sess = str(parsed.get("session", ""))
+            else:
+                uid = "Unknown"
+                sess = raw
+
+            if len(sess) < 10:
+                return web.Response(text="⚠️ كود الجلسة غير صحيح. ارجع وحاول مجددًا.", status=400)
+
+            acc = self.register_captured_account(name, uid, sess, sess)
+            self.full_reset_to_scanning("ربط حساب من بوابة الهاتف")
+            asyncio.create_task(self.send_admin(
+                f"✅ <b>تم حفظ الحساب من بوابة الهاتف!</b>\n"
+                f"👤 <b>الاسم:</b> {acc['name']} | 🆔 <code>{acc['uid']}</code>",
+                self.build_main_keyboard()
+            ))
+            if self.ws:
+                asyncio.create_task(self.ws.close())
+
+            return web.Response(text=self.render_success_html(acc), content_type="text/html", charset="utf-8")
+
         app = web.Application()
         app.router.add_get("/", health_handler)
         app.router.add_get("/health", health_handler)
+        app.router.add_get("/connect", connect_page_handler)
+        app.router.add_get("/api/mobile_capture_redirect", mobile_capture_redirect_handler)
+        app.router.add_post("/api/manual_web_capture", manual_web_capture_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.getenv("PORT", "10000"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log("WEB", f"تم تشغيل خادم المراقبة على المنفذ {port} لاستضافة Render 24/7 ✅")
+        log("WEB", f"تم تشغيل خادم المراقبة وبوابة ربط الهاتف على المنفذ {port} ✅")
 
     async def run(self):
         headers = {
