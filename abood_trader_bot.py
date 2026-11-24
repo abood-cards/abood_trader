@@ -233,14 +233,14 @@ class AboodControlBot:
         self._load_accounts_storage()
 
         # ==========================================
-        # نظام التعزيز الذكي (زيادة مرة واحدة فقط حتى تعويض الخسارة أو إكمال الصفقات)
+        # نظام التعزيز الذكي (يُطبَّق على الصفقات الجديدة فقط دون المساس بالصفقات الجارية)
         # ==========================================
         self.boost_enabled = False
         self.boost_mode = "CAPITAL"          # "CAPITAL" = تعويض رأس المال للقمة | "TRADES" = عدد صفقات ناجحة محددة
         self.boost_increment = 10.0          # مقدار الزيادة الواحدة على المبلغ الأساسي عند الخسارة
         self.boost_target_wins = 5           # عدد الصفقات الناجحة المطلوبة في وضع "TRADES"
         self.boost_wins_done = 0             # عداد الصفقات الناجحة المنجزة أثناء التعزيز
-        self.effective_base_amount = 10.0    # المبلغ الأساسي العامل حاليًا
+        self.effective_base_amount = 10.0    # المبلغ الأساسي العامل للصفقات الجديدة حاليًا
         self.in_boost_recovery = False       # هل التعزيز نشط حاليًا بعد خسارة؟
         self.peak_balance = None             # أعلى قمة وصل إليها رأس المال قبل الخسارة
         self.current_cycle_spent = 0.0
@@ -285,7 +285,7 @@ class AboodControlBot:
         self.active_trades = []
         self.trade_seq = 0
         self.global_step_index = 0
-        self.pending_martingale_steps = []
+        self.pending_martingale_steps = []   # عناصر بصيغة: (next_g_idx, cycle_base)
 
         # سجل الإحصائيات اليومية + عائد التداول (Turnover)
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
@@ -608,8 +608,14 @@ class AboodControlBot:
             return self.asset_display_names[symbol].replace("/", "").replace(" OTC", "-OTC").strip()
         return symbol.replace("_otc", "-OTC").replace("#", "")
 
-    def get_trade_ladder(self) -> list[float]:
-        active_base = self.effective_base_amount if self.boost_enabled else self.base_amount
+    def get_current_entry_base(self) -> float:
+        """المبلغ الأساسي للصفقات الجديدة فقط (يأخذ التعزيز إن كان نشطًا، وإلا الأساسي الأصلي)"""
+        if self.boost_enabled and self.in_boost_recovery:
+            return self.effective_base_amount
+        return self.base_amount
+
+    def get_trade_ladder(self, custom_base: float | None = None) -> list[float]:
+        active_base = custom_base if custom_base is not None else self.get_current_entry_base()
         steps = self.global_steps if self.martingale_enabled else 1
         ladder = []
         for i in range(steps):
@@ -788,9 +794,9 @@ class AboodControlBot:
 
         if self.in_boost_recovery:
             if self.boost_mode == "CAPITAL":
-                prog = f"🔥 <b>نشط الآن</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | الرصيد الحالي: <code>{bal_str}</code> / الهدف: <code>{peak_str}</code>"
+                prog = f"🔥 <b>نشط الآن (للصفقات الجديدة)</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | الرصيد: <code>{bal_str}</code> / الهدف: <code>{peak_str}</code>"
             else:
-                prog = f"🔥 <b>نشط الآن</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code> صفقات"
+                prog = f"🔥 <b>نشط الآن (للصفقات الجديدة)</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code> صفقات"
         else:
             prog = f"⏳ في وضع الاستعداد (الأساسي الحالي: <b>${self.base_amount:g}</b>)"
 
@@ -799,7 +805,7 @@ class AboodControlBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة:</b> {en_str}\n"
             f"🎯 <b>نظام التعزيز:</b> {mode_str}\n"
-            f"➕ <b>مقدار الزيادة الواحدة:</b> <code>+${self.boost_increment:g}</code> (ثابتة طوال التعويض)\n"
+            f"➕ <b>مقدار الزيادة الواحدة:</b> <code>+${self.boost_increment:g}</code> (تبدأ من الصفقات الجديدة فقط)\n"
             f"🏆 <b>عدد الصفقات المستهدفة:</b> <code>{self.boost_target_wins} صفقات ناجحة</code>\n"
             f"🏔 <b>قمة رأس المال المسجلة:</b> <code>{peak_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -945,12 +951,12 @@ class AboodControlBot:
             if self.boost_mode == "CAPITAL":
                 peak_txt = f"${format_money(self.peak_balance)}" if self.peak_balance is not None else "—"
                 if self.in_boost_recovery:
-                    boost_status = f"🟢 مفعّل [تعويض القمة] (الأساسي: <b>${self.effective_base_amount:g}</b> | الهدف: <code>{peak_txt}</code>)"
+                    boost_status = f"🟢 مفعّل [تعويض القمة] (للجديدة: <b>${self.effective_base_amount:g}</b> | الهدف: <code>{peak_txt}</code>)"
                 else:
                     boost_status = f"🟢 مفعّل [تعويض القمة] (+${self.boost_increment:g} | القمة: <code>{peak_txt}</code>)"
             else:
                 if self.in_boost_recovery:
-                    boost_status = f"🟢 مفعّل [عدد صفقات] (الأساسي: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code>)"
+                    boost_status = f"🟢 مفعّل [عدد صفقات] (للجديدة: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code>)"
                 else:
                     boost_status = f"🟢 مفعّل [عدد صفقات] (+${self.boost_increment:g} | الهدف: <code>{self.boost_target_wins} صفقات</code>)"
         else:
@@ -1403,7 +1409,7 @@ class AboodControlBot:
                         elif data == "set_boost_inc":
                             self.awaiting_input = "BOOST_INC"
                             await self.send_admin(
-                                "🛡️ أرسل الآن <b>مقدار الزيادة الواحدة في التعزيز</b> التي تُضاف على المبلغ الأساسي عند الخسارة "
+                                "🛡️ أرسل الآن <b>مقدار الزيادة الواحدة في التعزيز</b> التي تُضاف على المبلغ الأساسي للصفقات الجديدة عند الخسارة "
                                 "(مثال: <code>2</code> أو <code>10</code>):"
                             )
                             continue
@@ -1640,7 +1646,7 @@ class AboodControlBot:
                                         self.effective_base_amount = self.base_amount + inc
                                     self.awaiting_input = None
                                     await self.send_admin(
-                                        f"✅ تم ضبط زيادة التعزيز الواحدة إلى <b>+${inc:g}</b> عند الخسارة.",
+                                        f"✅ تم ضبط زيادة التعزيز الواحدة إلى <b>+${inc:g}</b> للصفقات الجديدة عند الخسارة.",
                                         self.build_boost_keyboard()
                                     )
                             except ValueError:
@@ -1916,12 +1922,17 @@ class AboodControlBot:
         trade_minute: int,
         signal_uid: int | None,
         is_draw_retry: bool = False,
-        is_cont_entry: bool = False
+        is_cont_entry: bool = False,
+        cycle_base: float | None = None
     ):
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
-        ladder = self.get_trade_ladder()
+        # إذا لم يُمرَّر أساس دورة سابقة -> فهذه صفقة جديدة وتبدأ بالأساسي الحالي (المعزّز إن كان نشطًا)
+        if cycle_base is None:
+            cycle_base = self.get_current_entry_base()
+
+        ladder = self.get_trade_ladder(custom_base=cycle_base)
         if not self.martingale_enabled:
             g_idx = 0
         else:
@@ -1968,6 +1979,7 @@ class AboodControlBot:
             "entry_price": entry_price,
             "price_confirmed": False,
             "amount": amount,
+            "cycle_base": cycle_base,   # حفظ المبلغ الأساسي الخاص بهذه الدورة حتى نهايتها
             "signal_uid": signal_uid,
             "is_cont": is_cont_entry,
         }
@@ -1993,7 +2005,7 @@ class AboodControlBot:
         tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else (" (مواصلة النموذج 🔄)" if is_cont_entry else "")
         log(
             "TRADE_EXEC",
-            f"⚡ تنفيذ [{mode_tag}]{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} | "
+            f"⚡ تنفيذ [{mode_tag}]{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} (أساس الدورة: ${cycle_base:g}) | "
             f"سعر الفتح: {entry_price} | [عام {g_idx + 1}/{len(ladder)} | زوج {p_idx + 1}/{self.pair_steps}]"
         )
 
@@ -2062,6 +2074,7 @@ class AboodControlBot:
                     g_idx = trade["g_idx"]
                     p_idx = trade["p_idx"]
                     won_amount = trade["amount"]
+                    trade_cycle_base = trade["cycle_base"]
                     is_cont = trade["is_cont"]
 
                     result = self.evaluate_trade_result(trade)
@@ -2069,7 +2082,7 @@ class AboodControlBot:
                     sup_num = to_superscript(attempt_num)
                     curr_p = self.latest_prices.get(asset)
                     next_minute = (trade["trade_minute"] or int(server_now // 60) * 60) + 60
-                    ladder = self.get_trade_ladder()
+                    ladder = self.get_trade_ladder(custom_base=trade_cycle_base)
 
                     log(
                         "TRADE_CHECK",
@@ -2122,7 +2135,7 @@ class AboodControlBot:
                                     else:
                                         log("BOOST_PROG", f"🛡️ تقدم التعزيز نحو القمة: المتوقع ${format_money(projected_bal)} / الهدف ${format_money(self.peak_balance)}")
 
-                        # تفعيل مواصلة النموذج إذا ربحت من أول دخول وكانت الميزة مفعّلة
+                        # تفعيل مواصلة النموذج (تُعامل كصفقة جديدة فتأخذ الأساسي الحالي أو المعزّز)
                         if self.continuation_enabled and attempt_num == 1 and not is_cont:
                             eligible, _ = self.is_pair_eligible(asset)
                             if eligible:
@@ -2135,11 +2148,12 @@ class AboodControlBot:
                                     p_idx=0,
                                     trade_minute=next_minute,
                                     signal_uid=None,
-                                    is_cont_entry=True
+                                    is_cont_entry=True,
+                                    cycle_base=None
                                 )
                         continue
 
-                    # ب) حالة التعادل (DRAW)
+                    # ب) حالة التعادل (DRAW) — إعادة الدخول بنفس المبلغ الأساسي للدورة الجارية
                     if result == "DRAW":
                         self.current_cycle_spent -= won_amount
                         log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ (${won_amount}) دون تدبيل.")
@@ -2151,7 +2165,8 @@ class AboodControlBot:
                             trade_minute=next_minute,
                             signal_uid=sig_uid,
                             is_draw_retry=True,
-                            is_cont_entry=is_cont
+                            is_cont_entry=is_cont,
+                            cycle_base=trade_cycle_base
                         )
                         continue
 
@@ -2166,7 +2181,7 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # زيادة التعزيز مرة واحدة فقط عند أول خسارة والبقاء عليه حتى التعويض
+                        # زيادة التعزيز مرة واحدة فقط للصفقات الجديدة القادمة
                         if self.boost_enabled and not self.in_boost_recovery:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
@@ -2191,7 +2206,7 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
-                        # تفعيل التعزيز مرة واحدة فقط عند خسارة الدورة والبقاء عليه حتى التعويض
+                        # تفعيل التعزيز مرة واحدة فقط للصفقات الجديدة عند خسارة الدورة
                         if self.boost_enabled and not self.in_boost_recovery:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
@@ -2203,28 +2218,33 @@ class AboodControlBot:
                         self.current_cycle_spent = 0.0
                         self.global_step_index = 0
                         if next_p_idx < self.pair_steps:
+                            # بداية دورة جديدة (g_idx=0) -> تأخذ الأساسي الجديد (المعزّز)
                             await self.open_trade(
                                 asset, direction,
                                 g_idx=0, p_idx=next_p_idx,
                                 trade_minute=next_minute,
-                                signal_uid=sig_uid
+                                signal_uid=sig_uid,
+                                cycle_base=None
                             )
                     else:
                         if next_p_idx < self.pair_steps:
+                            # استمرار التدبيل لنفس الصفقة الجارية -> تحافظ على cycle_base الأصلي للدورة!
                             self.global_step_index = next_g_idx
                             await self.open_trade(
                                 asset, direction,
                                 g_idx=next_g_idx, p_idx=next_p_idx,
                                 trade_minute=next_minute,
                                 signal_uid=sig_uid,
-                                is_cont_entry=is_cont
+                                is_cont_entry=is_cont,
+                                cycle_base=trade_cycle_base
                             )
                         else:
+                            # ترحيل خطوة التدبيل للزوج القادم مع الحفاظ على أساس دورتها الأصلي
                             self.global_step_index = next_g_idx
-                            self.pending_martingale_steps.append(next_g_idx)
+                            self.pending_martingale_steps.append((next_g_idx, trade_cycle_base))
                             log(
                                 "PAIR_SWITCH",
-                                f"اكتمال {self.pair_steps} محاولات على {sig_sym} — ترحيل التدبيل إلى الخطوة {next_g_idx + 1}/{self.global_steps}"
+                                f"اكتمال {self.pair_steps} محاولات على {sig_sym} — ترحيل التدبيل إلى الخطوة {next_g_idx + 1}/{self.global_steps} (أساس الدورة: ${trade_cycle_base:g})"
                             )
 
             # ========================================================
@@ -2319,13 +2339,16 @@ class AboodControlBot:
                         for cand in selected_to_enter:
                             if self.martingale_enabled:
                                 if self.pending_martingale_steps:
-                                    step_to_use = self.pending_martingale_steps.pop(0)
+                                    step_to_use, carried_base = self.pending_martingale_steps.pop(0)
                                 elif not any(t["g_idx"] > 0 for t in self.active_trades):
                                     step_to_use = self.global_step_index
+                                    carried_base = None  # صفقة جديدة تبدأ بالتعزيز إن كان مفعّلاً
                                 else:
                                     step_to_use = 0
+                                    carried_base = None  # صفقة جديدة تبدأ بالتعزيز إن كان مفعّلاً
                             else:
                                 step_to_use = 0
+                                carried_base = None
 
                             next_trade_minute = cand["target_minute"] + 60
                             await self.open_trade(
@@ -2334,7 +2357,8 @@ class AboodControlBot:
                                 g_idx=step_to_use,
                                 p_idx=0,
                                 trade_minute=next_trade_minute,
-                                signal_uid=cand["signal_uid"]
+                                signal_uid=cand["signal_uid"],
+                                cycle_base=carried_base
                             )
                     else:
                         if future_candidates:
@@ -2352,21 +2376,21 @@ class AboodControlBot:
             bal_txt = f"${format_money(self.account_balance)}" if self.account_balance is not None else "—"
             log(
                 "BOOST_UP",
-                f"🛡️ تفعيل التعزيز الثابت (تعويض القمة)! الأساسي المعزّز: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
+                f"🛡️ تفعيل التعزيز للصفقات الجديدة (تعويض القمة)! الأساسي المعزّز: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
             )
             asyncio.create_task(self.send_admin(
-                f"🛡️ <b>تم تفعيل التعزيز الثابت (تعويض القمة)!</b>\n"
-                f"💵 المبلغ الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> (مستمر حتى التعويض)\n"
+                f"🛡️ <b>تم تفعيل التعزيز للصفقات الجديدة (تعويض القمة)!</b>\n"
+                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b> (يُطبَّق على الصفقات الجديدة فقط)\n"
                 f"💰 الرصيد الحالي: <code>{bal_txt}</code> ⬅️ القمة المستهدفة: <code>{peak_txt}</code>"
             ))
         else:
             log(
                 "BOOST_UP",
-                f"🛡️ تفعيل التعزيز الثابت (عدد صفقات)! الأساسي المعزّز: ${self.effective_base_amount:g} | الهدف: {self.boost_target_wins} صفقات ناجحة"
+                f"🛡️ تفعيل التعزيز للصفقات الجديدة (عدد صفقات)! الأساسي المعزّز: ${self.effective_base_amount:g} | الهدف: {self.boost_target_wins} صفقات ناجحة"
             )
             asyncio.create_task(self.send_admin(
-                f"🛡️ <b>تم تفعيل التعزيز الثابت (عدد صفقات)!</b>\n"
-                f"💵 المبلغ الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> (مستمر حتى إكمال الصفقات)\n"
+                f"🛡️ <b>تم تفعيل التعزيز للصفقات الجديدة (عدد صفقات)!</b>\n"
+                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b> (يُطبَّق على الصفقات الجديدة فقط)\n"
                 f"🏆 المطلوب: <code>{self.boost_target_wins} صفقات ناجحة</code> للعودة للأساسي الأصلي."
             ))
 
