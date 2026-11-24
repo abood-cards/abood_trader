@@ -210,18 +210,18 @@ class AboodControlBot:
         # ==========================================
         # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
         # ==========================================
-        self.indicators_enabled = False       # الزر العام للتشغيل/الإيقاف (متوقف افتراضيًا للاعتماد على الشطرنج وحده عند الرغبة)
-        self.ind_bb_enabled = True            # مؤشر البولينجر باند (20, 2)
-        self.ind_bb_zone = 0.70               # 70% من المسافة بين المنتصف والحد الخارجي (شرط متوسط غير صارم)
-        self.ind_rsi_enabled = True           # مؤشر RSI (14)
+        self.indicators_enabled = False
+        self.ind_bb_enabled = True
+        self.ind_bb_zone = 0.70
+        self.ind_rsi_enabled = True
         self.ind_rsi_period = 14
-        self.ind_rsi_overbought = 62.0        # تشبع شرائي متوسط (62 بدل 70)
-        self.ind_rsi_oversold = 38.0          # تشبع بيعي متوسط (38 بدل 30)
-        self.ind_wick_enabled = True          # فلتر جسم الشمعة والذيل (منع الدوجي والذيل العكسي العنيف)
-        self.ind_stoch_enabled = False        # مؤشر ستوكاستيك (5, 3, 3) اختياري
+        self.ind_rsi_overbought = 62.0
+        self.ind_rsi_oversold = 38.0
+        self.ind_wick_enabled = True
+        self.ind_stoch_enabled = False
         self.ind_stoch_overbought = 75.0
         self.ind_stoch_oversold = 25.0
-        self.ind_atr_enabled = False          # فلتر السيولة ATR (14) اختياري
+        self.ind_atr_enabled = False
         self.last_ind_skip_log = {}
 
         # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
@@ -232,12 +232,17 @@ class AboodControlBot:
         self.temp_new_acc_name = ""
         self._load_accounts_storage()
 
-        # 1) إعدادات وضع التعزيز بعد خسارة التدبيل العام (متوقف افتراضيًا)
+        # ==========================================
+        # نظام التعزيز الذكي (وضع تعويض القمة أو وضع عدد الصفقات الناجحة)
+        # ==========================================
         self.boost_enabled = False
-        self.boost_increment = 10.0
-        self.effective_base_amount = 10.0
-        self.in_boost_recovery = False
-        self.recovery_balance = 0.0
+        self.boost_mode = "CAPITAL"          # "CAPITAL" = تعويض رأس المال للقمة | "TRADES" = عدد صفقات ناجحة محددة
+        self.boost_increment = 10.0          # مقدار الزيادة على المبلغ الأساسي بعد خسارة دورة التدبيل
+        self.boost_target_wins = 5           # عدد الصفقات الناجحة المطلوبة في وضع "TRADES"
+        self.boost_wins_done = 0             # عداد الصفقات الناجحة المنجزة أثناء التعزيز
+        self.effective_base_amount = 10.0    # المبلغ الأساسي العامل حاليًا
+        self.in_boost_recovery = False       # هل التعزيز نشط حاليًا بعد خسارة؟
+        self.peak_balance = None             # أعلى قمة وصل إليها رأس المال قبل الخسارة
         self.current_cycle_spent = 0.0
 
         # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول (متوقف افتراضيًا)
@@ -291,11 +296,6 @@ class AboodControlBot:
     # محرك تقييم المؤشرات والفلاتر (بشروط متوسطة)
     # ==========================================
     def check_indicators(self, asset: str, direction: str, is_pre_close: bool = False) -> tuple[bool, str]:
-        """
-        يفحص المؤشرات المفعّلة إذا كان الزر العام للمؤشرات مفعّلاً.
-        is_pre_close=False: فحص تمهيدي مرن أثناء المسح.
-        is_pre_close=True: فحص نهائي متوسط قبل الإغلاق مباشرة.
-        """
         if not self.indicators_enabled:
             return True, "الشطرنج فقط"
 
@@ -312,7 +312,6 @@ class AboodControlBot:
         h_price = last_c.get("high", max(o_price, c_price))
         l_price = last_c.get("low", min(o_price, c_price))
 
-        # 1) فلتر جسم الشمعة والذيل (يُفحص بدقة عند اقتراب الإغلاق)
         if self.ind_wick_enabled and is_pre_close:
             body = abs(c_price - o_price)
             total_range = max(h_price - l_price, body)
@@ -329,7 +328,6 @@ class AboodControlBot:
                 if lower_wick > (2.2 * body):
                     return False, "ذيل سفلي طويل معاكس للشراء"
 
-        # 2) مؤشر البولينجر باند (Bollinger Bands 20, 2)
         if self.ind_bb_enabled:
             bb = calc_bollinger(closes, period=20, mult=2.0)
             if bb is not None:
@@ -346,7 +344,6 @@ class AboodControlBot:
                         if pos < req_zone:
                             return False, f"البولينجر ({int(pos * 100)}% < {int(req_zone * 100)}%)"
 
-        # 3) مؤشر القوة النسبية (RSI)
         if self.ind_rsi_enabled:
             rsi = calc_rsi(closes, period=self.ind_rsi_period)
             if rsi is not None:
@@ -359,7 +356,6 @@ class AboodControlBot:
                     if rsi > req_os:
                         return False, f"RSI ({rsi:.1f} > {req_os:.0f})"
 
-        # 4) مؤشر ستوكاستيك (Stochastic 5, 3, 3)
         if self.ind_stoch_enabled:
             stoch = calc_stochastic(ordered_candles, k_period=5, smooth=3)
             if stoch is not None:
@@ -372,7 +368,6 @@ class AboodControlBot:
                     if stoch > req_s_os:
                         return False, f"Stoch ({stoch:.1f} > {req_s_os:.0f})"
 
-        # 5) فلتر السيولة (ATR 14)
         if self.ind_atr_enabled and is_pre_close:
             atr = calc_atr(ordered_candles, period=14)
             if atr is not None and atr > 0:
@@ -455,17 +450,14 @@ class AboodControlBot:
             return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame}
         return self.accounts[self.active_account_idx]
 
-    def reset_boost_state(self):
+    def reset_boost_state(self, reset_peak: bool = False):
+        """إعادة ضبط حالة التعزيز والعودة للمبلغ الأساسي الأصلي"""
         self.in_boost_recovery = False
-        self.recovery_balance = 0.0
+        self.boost_wins_done = 0
         self.current_cycle_spent = 0.0
         self.effective_base_amount = self.base_amount
-
-    def reset_daily_stats(self):
-        self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
-        self.daily_records.clear()
-        self.total_turnover = 0.0
-        log("STATS", "تم تصفير الإحصائيات وعائد التداول بالكامل 🗑️")
+        if reset_peak:
+            self.peak_balance = float(self.account_balance) if self.account_balance is not None else None
 
     def record_trade_outcome(self, pair_name: str, is_win: bool, attempt_num: int):
         today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
@@ -673,7 +665,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + قائمة المؤشرات
+    # واجهة التحكم (خاص بالأدمن) + قائمة المؤشرات + قائمة التعزيز
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -743,7 +735,7 @@ class AboodControlBot:
                 ],
                 [
                     boost_btn,
-                    {"text": f"➕ زيادة التعزيز (+${self.boost_increment:g})", "callback_data": "set_boost_inc"}
+                    {"text": "⚙️ ضبط التعزيز", "callback_data": "menu_boost"}
                 ],
                 [
                     {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"},
@@ -754,6 +746,65 @@ class AboodControlBot:
                 ]
             ]
         }
+
+    def build_boost_keyboard(self) -> dict:
+        en_btn = (
+            {"text": "🛡️ حالة التعزيز: مفعّل 🟢", "callback_data": "boost_toggle_enable"}
+            if self.boost_enabled
+            else {"text": "🛡️ حالة التعزيز: متوقف 🔴", "callback_data": "boost_toggle_enable"}
+        )
+        mode_btn = (
+            {"text": "🎯 نوع التعزيز: تعويض القمة 💰", "callback_data": "boost_toggle_mode"}
+            if self.boost_mode == "CAPITAL"
+            else {"text": "🎯 نوع التعزيز: عدد صفقات ناجحة 🏆", "callback_data": "boost_toggle_mode"}
+        )
+
+        return {
+            "inline_keyboard": [
+                [en_btn],
+                [mode_btn],
+                [
+                    {"text": f"➕ زيادة التعزيز (+${self.boost_increment:g})", "callback_data": "set_boost_inc"},
+                    {"text": f"🔢 عدد الصفقات ({self.boost_target_wins})", "callback_data": "set_boost_wins"}
+                ],
+                [
+                    {"text": "🔄 تصفير التعزيز والعودة للأساسي", "callback_data": "boost_reset_now"}
+                ],
+                [
+                    {"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}
+                ]
+            ]
+        }
+
+    def format_boost_menu_text(self) -> str:
+        en_str = "🟢 <b>مفعّل</b>" if self.boost_enabled else "🔴 <b>متوقف</b>"
+        mode_str = (
+            "💰 <b>تعويض رأس المال إلى القمة</b> (يستمر بالتعزيز حتى يعود الرصيد لأعلى قمة وصل إليها)"
+            if self.boost_mode == "CAPITAL"
+            else f"🏆 <b>عدد صفقات ناجحة محددة</b> (يستمر بالتعزيز حتى يحقق <b>{self.boost_target_wins}</b> صفقات رابحة)"
+        )
+        peak_str = f"${format_money(self.peak_balance)}" if self.peak_balance is not None else "غير مسجل بعد"
+        bal_str = f"${format_money(self.account_balance)}" if self.account_balance is not None else "غير متاح"
+
+        if self.in_boost_recovery:
+            if self.boost_mode == "CAPITAL":
+                prog = f"🔥 <b>نشط الآن</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | الرصيد الحالي: <code>{bal_str}</code> / الهدف: <code>{peak_str}</code>"
+            else:
+                prog = f"🔥 <b>نشط الآن</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code> صفقات"
+        else:
+            prog = f"⏳ في وضع الاستعداد (الأساسي الحالي: <b>${self.base_amount:g}</b>)"
+
+        return (
+            f"🛡️ <b>إعدادات التعزيز الذكي بعد الخسارة</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️ <b>الحالة:</b> {en_str}\n"
+            f"🎯 <b>نظام التعزيز:</b> {mode_str}\n"
+            f"➕ <b>مقدار الزيادة عند الخسارة:</b> <code>+${self.boost_increment:g}</code>\n"
+            f"🏆 <b>عدد الصفقات المستهدفة:</b> <code>{self.boost_target_wins} صفقات ناجحة</code>\n"
+            f"🏔 <b>قمة رأس المال المسجلة:</b> <code>{peak_str}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 <b>الوضع الحالي:</b> {prog}"
+        )
 
     def build_indicators_keyboard(self) -> dict:
         master_btn = (
@@ -873,7 +924,7 @@ class AboodControlBot:
         acc = self.get_active_account()
         acc_mode_str = "🧪 تجريبي (Demo)" if self.is_demo_mode else "💵 حقيقي (Live) 🔥"
         bal_label = "رصيد الديمو" if self.is_demo_mode else "الرصيد الحقيقي"
-        bal_str = f"${self.account_balance}" if self.account_balance is not None else "جاري الجلب..."
+        bal_str = f"${format_money(self.account_balance)}" if self.account_balance is not None else "جاري الجلب..."
 
         active_pairs = self.get_active_scan_pairs()
         eligible_count = sum(1 for p in active_pairs if self.payouts.get(p, 0) >= self.min_payout)
@@ -891,11 +942,17 @@ class AboodControlBot:
         )
 
         if self.boost_enabled:
-            if self.in_boost_recovery:
-                deficit = abs(round(self.recovery_balance, 2))
-                boost_status = f"🟢 مفعّل (الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | للتعويض: <code>${deficit}</code>)"
+            if self.boost_mode == "CAPITAL":
+                peak_txt = f"${format_money(self.peak_balance)}" if self.peak_balance is not None else "—"
+                if self.in_boost_recovery:
+                    boost_status = f"🟢 مفعّل [تعويض القمة] (الأساسي: <b>${self.effective_base_amount:g}</b> | الهدف: <code>{peak_txt}</code>)"
+                else:
+                    boost_status = f"🟢 مفعّل [تعويض القمة] (+${self.boost_increment:g} | القمة: <code>{peak_txt}</code>)"
             else:
-                boost_status = f"🟢 مفعّل (الزيادة عند الخسارة: <code>+${self.boost_increment:g}</code>)"
+                if self.in_boost_recovery:
+                    boost_status = f"🟢 مفعّل [عدد صفقات] (الأساسي: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code>)"
+                else:
+                    boost_status = f"🟢 مفعّل [عدد صفقات] (+${self.boost_increment:g} | الهدف: <code>{self.boost_target_wins} صفقات</code>)"
         else:
             boost_status = "🔴 متوقف"
 
@@ -1055,6 +1112,57 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "menu_boost":
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_boost_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_boost_keyboard()
+                            })
+                            continue
+                        elif data == "boost_toggle_enable":
+                            self.boost_enabled = not self.boost_enabled
+                            if self.boost_enabled and self.account_balance is not None and self.peak_balance is None:
+                                self.peak_balance = float(self.account_balance)
+                            if not self.boost_enabled:
+                                self.reset_boost_state(reset_peak=False)
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_boost_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_boost_keyboard()
+                            })
+                            continue
+                        elif data == "boost_toggle_mode":
+                            self.boost_mode = "TRADES" if self.boost_mode == "CAPITAL" else "CAPITAL"
+                            if self.boost_mode == "CAPITAL" and self.account_balance is not None and self.peak_balance is None:
+                                self.peak_balance = float(self.account_balance)
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_boost_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_boost_keyboard()
+                            })
+                            continue
+                        elif data == "boost_reset_now":
+                            self.reset_boost_state(reset_peak=True)
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_boost_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_boost_keyboard()
+                            })
+                            continue
+                        elif data == "set_boost_wins":
+                            self.awaiting_input = "BOOST_WINS"
+                            await self.send_admin(
+                                "🏆 أرسل الآن <b>عدد الصفقات الناجحة المطلوبة</b> في وضع التعزيز قبل العودة للمبلغ الأساسي (مثال: <code>5</code>):"
+                            )
+                            continue
                         elif data == "toggle_indicators_master":
                             self.indicators_enabled = not self.indicators_enabled
                             log("IND_MASTER", f"حالة المؤشرات والفلاتر: {'مفعّل 🟢' if self.indicators_enabled else 'متوقف 🔴'}")
@@ -1158,6 +1266,7 @@ class AboodControlBot:
                             else:
                                 self.is_demo_mode = True
                                 self.account_balance = None
+                                self.reset_boost_state(reset_peak=True)
                                 self._sync_active_auth_frame()
                                 self._save_accounts_storage()
                                 self.full_reset_to_scanning("التحويل إلى الحساب التجريبي")
@@ -1167,6 +1276,7 @@ class AboodControlBot:
                         elif data == "confirm_live_mode":
                             self.is_demo_mode = False
                             self.account_balance = None
+                            self.reset_boost_state(reset_peak=True)
                             self._sync_active_auth_frame()
                             self._save_accounts_storage()
                             self.full_reset_to_scanning("التحويل إلى الحساب الحقيقي")
@@ -1195,6 +1305,7 @@ class AboodControlBot:
                                 if 0 <= idx < len(self.accounts):
                                     self.active_account_idx = idx
                                     self.account_balance = None
+                                    self.reset_boost_state(reset_peak=True)
                                     self._sync_active_auth_frame()
                                     self._save_accounts_storage()
                                     self.full_reset_to_scanning("تغيير الحساب النشط")
@@ -1230,6 +1341,7 @@ class AboodControlBot:
                                     if self.active_account_idx >= len(self.accounts):
                                         self.active_account_idx = 0
                                     self.account_balance = None
+                                    self.reset_boost_state(reset_peak=True)
                                     self._sync_active_auth_frame()
                                     self._save_accounts_storage()
                                     self.full_reset_to_scanning("حذف حساب")
@@ -1254,8 +1366,10 @@ class AboodControlBot:
                             continue
                         elif data == "toggle_boost":
                             self.boost_enabled = not self.boost_enabled
+                            if self.boost_enabled and self.account_balance is not None and self.peak_balance is None:
+                                self.peak_balance = float(self.account_balance)
                             if not self.boost_enabled:
-                                self.reset_boost_state()
+                                self.reset_boost_state(reset_peak=False)
                             log("BOOST", f"حالة وضع التعزيز: {'مفعّل 🟢' if self.boost_enabled else 'متوقف 🔴'}")
                         elif data == "toggle_cont":
                             self.continuation_enabled = not self.continuation_enabled
@@ -1290,7 +1404,7 @@ class AboodControlBot:
                             self.awaiting_input = "BOOST_INC"
                             await self.send_admin(
                                 "🛡️ أرسل الآن <b>مقدار الزيادة في التعزيز</b> التي تُضاف على المبلغ الأساسي بعد الخسارة "
-                                "(مثال: <code>10</code>):"
+                                "(مثال: <code>2</code> أو <code>10</code>):"
                             )
                             continue
                         elif data == "set_global_steps":
@@ -1364,14 +1478,29 @@ class AboodControlBot:
                             continue
 
                         if text in ("/reset_boost", "تصفير التعزيز"):
-                            self.reset_boost_state()
+                            self.reset_boost_state(reset_peak=True)
                             await self.send_admin(
                                 f"✅ تم تصفير التعزيز وإعادة المبلغ الأساسي إلى <b>${self.base_amount:g}</b>.",
                                 self.build_main_keyboard()
                             )
                             continue
 
-                        if self.awaiting_input == "IND_BB_ZONE":
+                        if self.awaiting_input == "BOOST_WINS":
+                            try:
+                                w_cnt = int(text)
+                                if 1 <= w_cnt <= 50:
+                                    self.boost_target_wins = w_cnt
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط هدف التعزيز إلى <b>{w_cnt} صفقات ناجحة</b> قبل العودة للمبلغ الأساسي.",
+                                        self.build_boost_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل عددًا بين 1 و 50 (مثال: <code>5</code>):")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>5</code>):")
+
+                        elif self.awaiting_input == "IND_BB_ZONE":
                             try:
                                 pct_val = float(text.replace("%", ""))
                                 if 40 <= pct_val <= 110:
@@ -1468,6 +1597,7 @@ class AboodControlBot:
                                 self.accounts.append(new_acc)
                                 self.active_account_idx = len(self.accounts) - 1
                                 self.account_balance = None
+                                self.reset_boost_state(reset_peak=True)
                                 self._sync_active_auth_frame()
                                 self._save_accounts_storage()
                                 self.awaiting_input = None
@@ -1507,10 +1637,10 @@ class AboodControlBot:
                                     self.awaiting_input = None
                                     await self.send_admin(
                                         f"✅ تم ضبط زيادة التعزيز إلى <b>+${inc:g}</b> بعد خسارة التدبيل العام.",
-                                        self.build_main_keyboard()
+                                        self.build_boost_keyboard()
                                     )
                             except ValueError:
-                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>10</code>):")
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>2</code> أو <code>10</code>):")
 
                         elif self.awaiting_input == "GLOBAL_STEPS":
                             try:
@@ -1576,6 +1706,7 @@ class AboodControlBot:
                                 self.accounts[self.active_account_idx]["auth_frame"] = text.strip()
                                 self.accounts[self.active_account_idx]["uid"] = uid
                                 self.account_balance = None
+                                self.reset_boost_state(reset_peak=True)
                                 self._sync_active_auth_frame()
                                 self._save_accounts_storage()
                                 self.awaiting_input = None
@@ -1841,8 +1972,6 @@ class AboodControlBot:
 
         self.total_turnover += amount
         self.current_cycle_spent += amount
-        if self.boost_enabled and self.in_boost_recovery:
-            self.recovery_balance -= amount
 
         order_payload = {
             "asset": asset,
@@ -1960,18 +2089,34 @@ class AboodControlBot:
                             self.global_step_index = 0
                         self.current_cycle_spent = 0.0
 
+                        # متابعة تقدم التعزيز عند الربح
                         if self.boost_enabled and self.in_boost_recovery:
-                            payout_pct = self.payouts.get(asset, self.min_payout)
-                            self.recovery_balance += won_amount * (1.0 + payout_pct / 100.0)
-                            if self.recovery_balance >= 0:
-                                log("BOOST_DONE", f"🎉 تم تعويض خسارة التعزيز بالكامل! العودة للمبلغ الأساسي ${self.base_amount:g}")
-                                asyncio.create_task(self.send_admin(
-                                    f"🎉 <b>تم تعويض الخسارة بالكامل في وضع التعزيز!</b>\n"
-                                    f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
-                                ))
-                                self.reset_boost_state()
-                            else:
-                                log("BOOST_PROG", f"🛡️ تقدم التعزيز: المتبقي للتعويض ${abs(self.recovery_balance):.2f}")
+                            if self.boost_mode == "TRADES":
+                                self.boost_wins_done += 1
+                                if self.boost_wins_done >= self.boost_target_wins:
+                                    log("BOOST_DONE", f"🎉 اكتملت صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})! العودة للأساسي ${self.base_amount:g}")
+                                    asyncio.create_task(self.send_admin(
+                                        f"🎉 <b>اكتمل عدد صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})!</b>\n"
+                                        f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                                    ))
+                                    self.reset_boost_state(reset_peak=False)
+                                else:
+                                    log("BOOST_PROG", f"🛡️ تقدم التعزيز: تم إنجاز {self.boost_wins_done}/{self.boost_target_wins} صفقات ناجحة")
+
+                            elif self.boost_mode == "CAPITAL":
+                                payout_pct = self.payouts.get(asset, self.min_payout)
+                                if self.account_balance is not None and self.peak_balance is not None:
+                                    projected_bal = float(self.account_balance) + won_amount * (1.0 + payout_pct / 100.0)
+                                    if projected_bal >= (self.peak_balance - 0.01):
+                                        self.peak_balance = max(self.peak_balance, projected_bal)
+                                        log("BOOST_DONE", f"🎉 وصل رأس المال للقمة (${format_money(self.peak_balance)})! العودة للأساسي ${self.base_amount:g}")
+                                        asyncio.create_task(self.send_admin(
+                                            f"🎉 <b>تم تعويض رأس المال والعودة إلى القمة (${format_money(self.peak_balance)})!</b>\n"
+                                            f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                                        ))
+                                        self.reset_boost_state(reset_peak=False)
+                                    else:
+                                        log("BOOST_PROG", f"🛡️ تقدم التعزيز نحو القمة: المتوقع ${format_money(projected_bal)} / الهدف ${format_money(self.peak_balance)}")
 
                         # تفعيل مواصلة النموذج إذا ربحت من أول دخول وكانت الميزة مفعّلة
                         if self.continuation_enabled and attempt_num == 1 and not is_cont:
@@ -1993,9 +2138,6 @@ class AboodControlBot:
                     # ب) حالة التعادل (DRAW)
                     if result == "DRAW":
                         self.current_cycle_spent -= won_amount
-                        if self.boost_enabled and self.in_boost_recovery:
-                            self.recovery_balance += won_amount
-
                         log("DRAW", f"⚖️ تعادل على {sig_sym} — إعادة الدخول بنفس المبلغ (${won_amount}) دون تدبيل.")
                         await self.open_trade(
                             asset,
@@ -2019,6 +2161,17 @@ class AboodControlBot:
                             f"╰━━━━━━━━━━━━━━━╯"
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
+
+                        # في حال إيقاف التدبيل وتفعيل التعزيز: الخسارة الواحدة تعتبر دورة كاملة وتفعّل التعزيز
+                        if self.boost_enabled:
+                            if not self.in_boost_recovery:
+                                self.in_boost_recovery = True
+                                self.boost_wins_done = 0
+                                if self.peak_balance is None and self.account_balance is not None:
+                                    self.peak_balance = float(self.account_balance) + self.current_cycle_spent
+                            self.effective_base_amount += self.boost_increment
+                            self._notify_boost_activated()
+
                         self.current_cycle_spent = 0.0
                         continue
 
@@ -2035,25 +2188,17 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, loss_msg)
 
+                        # تفعيل أو تصعيد التعزيز عند خسارة التدبيل العام بالكامل
                         if self.boost_enabled:
                             if not self.in_boost_recovery:
                                 self.in_boost_recovery = True
-                                self.recovery_balance = -self.current_cycle_spent
-                            self.current_cycle_spent = 0.0
+                                self.boost_wins_done = 0
+                                if self.peak_balance is None and self.account_balance is not None:
+                                    self.peak_balance = float(self.account_balance) + self.current_cycle_spent
                             self.effective_base_amount += self.boost_increment
-                            log(
-                                "BOOST_UP",
-                                f"🛡️ تعزيز بعد خسارة الدورة! الأساسي الجديد: ${self.effective_base_amount:g} | "
-                                f"إجمالي المطلوب تعويضه: ${abs(self.recovery_balance):.2f}"
-                            )
-                            asyncio.create_task(self.send_admin(
-                                f"🛡️ <b>تم تفعيل/تصعيد التعزيز بعد الخسارة!</b>\n"
-                                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
-                                f"📉 إجمالي الخسارة المطلوب تعويضها: <code>${abs(self.recovery_balance):.2f}</code>"
-                            ))
-                        else:
-                            self.current_cycle_spent = 0.0
+                            self._notify_boost_activated()
 
+                        self.current_cycle_spent = 0.0
                         self.global_step_index = 0
                         if next_p_idx < self.pair_steps:
                             await self.open_trade(
@@ -2137,7 +2282,6 @@ class AboodControlBot:
                             (direction == "call" and live_color == "RED")
                         )
 
-                        # التحقق الإضافي من المؤشرات والفلاتر إذا كانت مفعّلة
                         ind_ok, ind_reason = (True, "متوقف")
                         if condition_met and self.indicators_enabled:
                             ind_ok, ind_reason = self.check_indicators(asset, direction, is_pre_close=True)
@@ -2199,6 +2343,30 @@ class AboodControlBot:
                                 self.switch_pair_keep_global("لم تستوفِ أي من الأزواج الممسوكة الشرط")
 
             self.refresh_mode_state()
+
+    def _notify_boost_activated(self):
+        if self.boost_mode == "CAPITAL":
+            peak_txt = f"${format_money(self.peak_balance)}" if self.peak_balance is not None else "غير متاح"
+            bal_txt = f"${format_money(self.account_balance)}" if self.account_balance is not None else "—"
+            log(
+                "BOOST_UP",
+                f"🛡️ تعزيز (تعويض القمة)! الأساسي الجديد: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
+            )
+            asyncio.create_task(self.send_admin(
+                f"🛡️ <b>تم تفعيل/تصعيد التعزيز (تعويض القمة)!</b>\n"
+                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
+                f"💰 الرصيد الحالي: <code>{bal_txt}</code> ⬅️ القمة المستهدفة: <code>{peak_txt}</code>"
+            ))
+        else:
+            log(
+                "BOOST_UP",
+                f"🛡️ تعزيز (عدد صفقات)! الأساسي الجديد: ${self.effective_base_amount:g} | الهدف: {self.boost_target_wins} صفقات ناجحة"
+            )
+            asyncio.create_task(self.send_admin(
+                f"🛡️ <b>تم تفعيل/تصعيد التعزيز (عدد صفقات)!</b>\n"
+                f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b>\n"
+                f"🏆 المطلوب: <code>{self.boost_target_wins} صفقات ناجحة</code> للعودة للأساسي الأصلي."
+            ))
 
     async def process_market_logic(self, asset: str, force_print: bool = False):
         if not self.is_running:
@@ -2328,9 +2496,23 @@ class AboodControlBot:
         if event_name == "successupdateBalance" and isinstance(data, dict):
             msg_is_demo = data.get("isDemo")
             if msg_is_demo is None or bool(msg_is_demo) == self.is_demo_mode:
-                self.account_balance = data.get("balance")
+                new_bal = float(data.get("balance", 0))
+                self.account_balance = new_bal
                 mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
-                log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${self.account_balance}")
+                log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${format_money(new_bal)}")
+
+                # تحديث قمة رأس المال والتحقق من اكتمال تعويض القمة
+                if self.peak_balance is None:
+                    self.peak_balance = new_bal
+                elif new_bal >= self.peak_balance:
+                    self.peak_balance = new_bal
+                    if self.boost_enabled and self.in_boost_recovery and self.boost_mode == "CAPITAL":
+                        log("BOOST_DONE", f"🎉 وصل رصيد الحساب للقمة (${format_money(self.peak_balance)})! العودة للأساسي ${self.base_amount:g}")
+                        asyncio.create_task(self.send_admin(
+                            f"🎉 <b>تم تعويض رأس المال والعودة إلى القمة (${format_money(self.peak_balance)})!</b>\n"
+                            f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                        ))
+                        self.reset_boost_state(reset_peak=False)
             return
 
         if event_name == "successopenOrder" and isinstance(data, dict):
@@ -2464,7 +2646,6 @@ class AboodControlBot:
             try:
                 log("SCAN", f"--- فحص [{self.get_scope_label()}]: {pair} ({payout}%) ---")
                 await ws.send(f'42["changeSymbol",{{"asset":"{pair}","period":60}}]')
-                # سحب 60 شمعة (3600 ثانية) لتغذية البولينجر باند والـ RSI والـ ATR بدقة
                 history_req = {
                     "asset": pair,
                     "index": self.req_index,
