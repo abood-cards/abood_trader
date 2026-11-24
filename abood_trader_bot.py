@@ -501,18 +501,16 @@ class AboodControlBot:
         return url
 
     def register_captured_account(self, name: str, uid: str, demo_session: str, live_session: str) -> dict:
-        """حفظ أو تحديث حساب تم التقاطه من الهاتف (يشمل جلسة الديمو والحقيقي معًا)"""
+        """حفظ أو تحديث حساب تم ربطه من الهاتف (يشمل جلسة الديمو والحقيقي معًا)"""
         clean_uid = str(uid).strip() or "Unknown"
         clean_name = (name or "").strip()[:30] or f"حساب {clean_uid}"
 
-        # إذا لم يتوفر إلا أحد الرمزين، نستخدم المتوفر لكليهما مع تغيير isDemo
         s_demo = (demo_session or live_session or "").strip()
         s_live = (live_session or demo_session or "").strip()
 
         demo_frame = make_auth_frame(s_demo, clean_uid, is_demo=True)
         live_frame = make_auth_frame(s_live, clean_uid, is_demo=False)
 
-        # إذا كان الحساب بنفس الـ UID محفوظًا مسبقًا -> نحدّث جلساته مباشرة
         existing_idx = None
         for idx, acc in enumerate(self.accounts):
             if str(acc.get("uid")) == clean_uid:
@@ -972,8 +970,12 @@ class AboodControlBot:
             }])
 
         rows.append([{
-            "text": "📱 إضافة حساب من الهاتف (تسجيل دخول مباشر)",
+            "text": "📱 فتح بوابة الربط من الهاتف",
             "url": self.get_mobile_connect_url()
+        }])
+        rows.append([{
+            "text": "📲 إرسال رابط الربط للنسخ (للمتصفح الخارجي)",
+            "callback_data": "send_mobile_link_copy"
         }])
         rows.append([
             {"text": "⌨️ إضافة يدوية بالجلسة", "callback_data": "add_account_start"},
@@ -1210,6 +1212,17 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "send_mobile_link_copy":
+                            link = self.get_mobile_connect_url()
+                            await self.send_admin(
+                                f"📲 <b>رابط الربط المباشر من متصفح الهاتف (Chrome / Safari):</b>\n\n"
+                                f"<code>{link}</code>\n\n"
+                                f"📌 <b>الخطوات السريعة:</b>\n"
+                                f"1️⃣ شغّل الـ <b>VPN</b> على هاتفك.\n"
+                                f"2️⃣ انسخ الرابط أعلاه وافتحه في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي.\n"
+                                f"3️⃣ اتبع الخطوة الموضحة في الصفحة لربط <b>الديمو + الحقيقي + الآيدي</b> دفعة واحدة."
+                            )
+                            continue
                         elif data == "menu_boost":
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
@@ -1391,7 +1404,7 @@ class AboodControlBot:
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
                                     f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
                                     f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n"
-                                    f"🔹 <b>ربط الهاتف المباشر:</b> متاح للأندرويد والآيفون (يلتقط الديمو والحقيقي والـ UID تلقائيًا) 📱\n\n"
+                                    f"🔹 <b>ربط الهاتف:</b> شغّل الـ VPN وافتح بوابة الربط في متصفح Chrome/Safari الخارجي 📱\n\n"
                                     f"اختر حسابًا للتبديل إليه فورًا أو أضف حسابًا جديدًا:"
                                 ),
                                 "parse_mode": "HTML",
@@ -2776,45 +2789,59 @@ class AboodControlBot:
 <title>ربط حساب عبود تريدينج</title>
 <style>
   * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-  body {{ margin: 0; padding: 16px; background: #0b1120; color: #f8fafc; }}
-  .card {{ max-width: 480px; margin: 0 auto; background: #131c31; border: 1px solid #1e293b; border-radius: 18px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
+  body {{ margin: 0; padding: 14px; background: #0b1120; color: #f8fafc; }}
+  .card {{ max-width: 480px; margin: 0 auto; background: #131c31; border: 1px solid #1e293b; border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
+  .wv-alert {{ display: none; background: #7f1d1d; border: 1px solid #ef4444; color: #fef2f2; padding: 14px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; line-height: 1.6; }}
   h2 {{ margin: 0 0 6px; font-size: 20px; color: #10b981; text-align: center; }}
-  p.sub {{ margin: 0 0 18px; font-size: 13px; color: #94a3b8; text-align: center; line-height: 1.5; }}
-  .step {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 14px; }}
-  .step-title {{ font-weight: 700; font-size: 14px; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }}
+  p.sub {{ margin: 0 0 16px; font-size: 13px; color: #94a3b8; text-align: center; line-height: 1.5; }}
+  .step {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 12px; }}
+  .step-title {{ font-weight: 700; font-size: 14px; color: #38bdf8; margin-bottom: 8px; }}
   input, textarea {{ width: 100%; background: #1e293b; border: 1px solid #334155; color: #fff; padding: 11px 12px; border-radius: 10px; font-size: 14px; outline: none; }}
   input:focus, textarea:focus {{ border-color: #10b981; }}
   .btn {{ display: block; width: 100%; text-align: center; padding: 13px; border-radius: 11px; font-weight: 700; font-size: 14px; text-decoration: none; border: none; cursor: pointer; margin-top: 8px; }}
   .btn-primary {{ background: linear-gradient(135deg, #10b981, #059669); color: #fff; }}
   .btn-blue {{ background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }}
   .btn-amber {{ background: linear-gradient(135deg, #f59e0b, #d97706); color: #0b1120; }}
-  .hint {{ font-size: 12px; color: #cbd5e1; line-height: 1.6; margin-top: 8px; }}
+  .btn-red {{ background: #ef4444; color: #fff; }}
+  .hint {{ font-size: 12.5px; color: #cbd5e1; line-height: 1.7; margin-top: 8px; }}
   .badge {{ display: inline-block; background: #064e3b; color: #6ee7b7; padding: 2px 8px; border-radius: 6px; font-size: 11px; }}
-  .toast {{ display: none; background: #065f46; color: #ecfdf5; padding: 10px; border-radius: 8px; text-align: center; font-size: 13px; margin-top: 8px; }}
+  .toast {{ display: none; background: #065f46; color: #ecfdf5; padding: 10px; border-radius: 8px; text-align: center; font-size: 13px; margin-top: 8px; line-height: 1.6; }}
 </style>
 </head>
 <body>
 <div class="card">
-  <h2>🛡 ربط حساب Pocket Option</h2>
-  <p class="sub">ربط مباشر من هاتفك (أندرويد / آيفون) بدون لابتوب<br><span class="badge">يلتقط الديمو + الحقيقي + الآيدي تلقائيًا</span></p>
+  <div id="wvBanner" class="wv-alert">
+    ⚠️ <b>أنت الآن داخل متصفح تيليجرام الداخلي!</b><br>
+    لنجاح ربط الحساب على الهاتف، يجب فتح هذه الصفحة في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي (مع تشغيل الـ VPN):
+    <button class="btn btn-red" onclick="openExternalBrowser()">🌐 فتح في متصفح Chrome / Safari الخارجي</button>
+    <button class="btn btn-amber" onclick="copyPageUrl()">📋 نسخ رابط هذه الصفحة لفتحه في المتصفح</button>
+  </div>
+
+  <h2>🛡 بوابة ربط حساب Pocket Option</h2>
+  <p class="sub">ربط مباشر من الهاتف (أندرويد / آيفون)<br><span class="badge">يحفظ الديمو + الحقيقي + الآيدي معًا</span></p>
 
   <div class="step">
-    <div class="step-title">1️⃣ أدخل اسمًا للحساب</div>
+    <div class="step-title">1️⃣ اسم الحساب (اختياري)</div>
     <input type="text" id="accName" placeholder="مثال: حسابي الرئيسي" value="">
   </div>
 
   <div class="step">
-    <div class="step-title">2️⃣ سجّل الدخول بحسابك في Pocket Option</div>
-    <p class="hint">افتح صفحة تسجيل الدخول، أدخل بريدك وكلمة المرور حتى تفتح لك واجهة التداول والشموع:</p>
-    <a href="https://pocketoption.com/en/login/" target="_blank" class="btn btn-blue">🌐 فتح تسجيل الدخول في Pocket Option</a>
+    <div class="step-title">2️⃣ تجهيز زر الربط في متصفح الهاتف</div>
+    <p class="hint">
+      • اضغط زر <b>نسخ كود الربط السريع</b> بالأسفل.<br>
+      • ثم اضغط قائمة المتصفح (<b>⋮</b> أو المشاركة) ⬅️ <b>إضافة إلى المفضلة (⭐)</b> ⬅️ <b>تعديل (Edit)</b> ⬅️ غيّر الاسم إلى <b>ربط البوت</b> والصق الكود المنسوخ في خانة <b>الرابط (URL)</b>.
+    </p>
+    <button class="btn btn-amber" onclick="copySmartExtractor()">📋 نسخ كود الربط السريع (Demo + Live)</button>
+    <div id="copyToast" class="toast">✅ تم نسخ كود الربط! الآن احفظ هذه الصفحة في المفضلة (⭐) وعدّل الرابط (URL) بلصق الكود فيه.</div>
   </div>
 
   <div class="step">
-    <div class="step-title">3️⃣ التقط جلسة الديمو والحقيقي بضغطة واحدة</div>
-    <p class="hint">بعد فتح واجهة التداول في المتصفح، اضغط نسخ أداة الالتقاط الذكية ثم شغّلها في شريط عنوان المتصفح (أو احفظها كمفضلة واضغط عليها):</p>
-    <button class="btn btn-amber" onclick="copySmartExtractor()">📋 نسخ أداة الالتقاط الذكية (Demo + Live)</button>
-    <a id="bookmarkletLink" href="#" class="btn btn-primary" style="margin-top:8px;">⚡ أداة الالتقاط السريع (اسحبها للمفضلة)</a>
-    <div id="copyToast" class="toast">✅ تم نسخ الأداة! اذهب الآن لصفحة Pocket Option، الصقها في شريط العنوان واكتب في أولها <b>javascript:</b> ثم اضغط ذهاب.</div>
+    <div class="step-title">3️⃣ تسجيل الدخول وإتمام الربط</div>
+    <p class="hint">
+      • تأكد أن الـ <b>VPN</b> يعمل، ثم افتح Pocket Option وسجّل الدخول حتى تظهر شموع التداول.<br>
+      • بعدها اضغط على شريط عنوان المتصفح، اكتب <b>ربط البوت</b>، واختر المفضلة التي حفظتها ليتم الربط والعودة للبوت فورًا!
+    </p>
+    <a href="https://pocketoption.com/en/login/" target="_blank" class="btn btn-blue">🌐 فتح تسجيل الدخول في Pocket Option</a>
   </div>
 
   <div class="step">
@@ -2835,26 +2862,49 @@ class AboodControlBot:
   const nameInput = document.getElementById('accName');
   if (PREFILL) nameInput.value = PREFILL;
 
+  const ua = navigator.userAgent || '';
+  const isAndroid = /Android/i.test(ua);
+  const isTgWebView = /Telegram/i.test(ua) || (isAndroid && /; wv\)/i.test(ua));
+  if (isTgWebView) {{
+    document.getElementById('wvBanner').style.display = 'block';
+  }}
+
+  function openExternalBrowser() {{
+    const cleanUrl = window.location.href.replace(/^https?:\/\//, '');
+    if (isAndroid) {{
+      window.location.href = 'intent://' + cleanUrl + '#Intent;scheme=https;package=com.android.chrome;end';
+    }} else {{
+      copyPageUrl();
+    }}
+  }}
+
+  function copyPageUrl() {{
+    const url = window.location.href;
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText(url).then(() => {{
+        alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
+      }}).catch(() => {{ prompt('انسخ الرابط التالي وافتحه في المتصفح الخارجي:', url); }});
+    }} else {{
+      prompt('انسخ الرابط التالي وافتحه في المتصفح الخارجي:', url);
+    }}
+  }}
+
   function buildExtractorCode() {{
     const nm = encodeURIComponent(nameInput.value.trim() || 'حساب الهاتف');
-    const js = `(async function(){{try{{alert('⏳ جاري التقاط جلسة الديمو والحقيقي والآيدي...');let h=document.documentElement.innerHTML;let u=(h.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/)||[])[1]||'';let ds=(h.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/)||[])[1]||'';let ls=ds;try{{let r1=await fetch('/en/cabinet/demo-quick-high-low/',{{credentials:'include'}});let t1=await r1.text();let m1=t1.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/);let u1=t1.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/);if(m1)ds=m1[1];if(u1)u=u1[1];}}catch(e){{}}try{{let r2=await fetch('/en/cabinet/quick-high-low/',{{credentials:'include'}});let t2=await r2.text();let m2=t2.match(/["']session["']\\s*:\\s*["']([a-zA-Z0-9_-]{{16,64}})["']/);let u2=t2.match(/["']uid["']\\s*:\\s*(\\d{{5,15}})/);if(m2)ls=m2[1];if(!u&&u2)u=u2[1];}}catch(e){{}}if(!ds&&!ls){{alert('⚠️ لم يتم العثور على الجلسة! تأكد أنك سجلت الدخول وفتحت صفحة التداول.');return;}}location.href='${{BASE_URL}}/api/mobile_capture_redirect?token=${{encodeURIComponent(TOKEN)}}&name=${{nm}}&uid='+encodeURIComponent(u)+'&demo_s='+encodeURIComponent(ds)+'&live_s='+encodeURIComponent(ls);}}catch(err){{alert('خطأ: '+err);}}}})();`;
+    const targetPrefix = BASE_URL + '/api/mobile_capture_redirect?token=' + encodeURIComponent(TOKEN) + '&name=' + nm;
+    const js = "(async function(){{try{{alert('⏳ جاري ربط الديمو والحقيقي بالبوت...');let h=document.documentElement.innerHTML;let u=(h.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/)||[])[1]||'';let ds=(h.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/)||[])[1]||'';let ls=ds;try{{let r1=await fetch('/en/cabinet/demo-quick-high-low/',{{credentials:'include'}});let t1=await r1.text();let m1=t1.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/);let u1=t1.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/);if(m1)ds=m1[1];if(u1)u=u1[1];}}catch(e){{}}try{{let r2=await fetch('/en/cabinet/quick-high-low/',{{credentials:'include'}});let t2=await r2.text();let m2=t2.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/);let u2=t2.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/);if(m2)ls=m2[1];if(!u&&u2)u=u2[1];}}catch(e){{}}if(!ds&&!ls){{alert('⚠️ تأكد أنك سجلت الدخول وفتحت صفحة التداول أولاً.');return;}}location.href='" + targetPrefix + "&uid='+encodeURIComponent(u)+'&demo_s='+encodeURIComponent(ds)+'&live_s='+encodeURIComponent(ls);}}catch(err){{alert('خطأ: '+err);}}}})();";
     return 'javascript:' + js;
   }}
 
-  function refreshLinks() {{
-    document.getElementById('bookmarkletLink').href = buildExtractorCode();
-  }}
-  nameInput.addEventListener('input', refreshLinks);
-  refreshLinks();
-
   function copySmartExtractor() {{
     const code = buildExtractorCode();
-    navigator.clipboard.writeText(code).then(() => {{
-      const t = document.getElementById('copyToast');
-      t.style.display = 'block';
-    }}).catch(() => {{
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText(code).then(() => {{
+        document.getElementById('copyToast').style.display = 'block';
+      }}).catch(() => {{ prompt('انسخ هذا الكود بالكامل:', code); }});
+    }} else {{
       prompt('انسخ هذا الكود بالكامل:', code);
-    }});
+    }}
   }}
 </script>
 </body>
@@ -2881,11 +2931,11 @@ class AboodControlBot:
   <div class="info">
     👤 <b>اسم الحساب:</b> {acc['name']}<br>
     🆔 <b>الآيدي (UID):</b> {acc['uid']}<br>
-    🧪 <b>جلسة الديمو:</b> جاهزة ✅<br>
-    💵 <b>جلسة الحقيقي:</b> جاهزة ✅
+    🧪 <b>الديمو (Demo):</b> جاهز ✅<br>
+    💵 <b>الحقيقي (Live):</b> جاهز ✅
   </div>
-  <p style="color:#94a3b8;font-size:13px;">تم حفظ الحساب وتفعيله في البوت تلقائيًا. يمكنك الآن العودة إلى تليجرام والتبديل بين الديمو والحقيقي بحرية.</p>
-  <a href="https://t.me/" class="btn">🔙 العودة إلى تليجرام</a>
+  <p style="color:#94a3b8;font-size:13px;">تم حفظ الحساب وتفعيله في البوت تلقائيًا. يمكنك الآن العودة إلى تليجرام والتبديل بين الديمو والحقيقي بضغطة زر.</p>
+  <a href="tg://resolve" class="btn">🔙 العودة إلى تليجرام</a>
 </div>
 </body>
 </html>"""
