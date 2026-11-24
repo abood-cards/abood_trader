@@ -20,7 +20,7 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
-DEFAULT_LEAD_SECONDS = 0.25
+DEFAULT_LEAD_SECONDS = 0.1
 
 # تعويض فارق أجزاء الثانية بين ساعة Render وساعة سيرفر Pocket Option
 SERVER_CLOCK_OFFSET = 0.75
@@ -136,7 +136,7 @@ class AboodControlBot:
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
 
-        # الوضع السريع (Turbo Mode): مسح مستمر وتجهيز صفقات جديدة بالتوازي مع الصفقات المفتوحة
+        # الوضع السريع (Turbo Mode): مسح مستمر وتجهيز صفقات جديدة بالتوازي مع الصفقات المفتوحة والتدبيل
         self.fast_mode = False
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
@@ -793,23 +793,10 @@ class AboodControlBot:
                         elif data == "cmd_status":
                             self.awaiting_input = None
                         elif data == "toggle_fast_mode":
-                            if not self.fast_mode:
-                                if self.martingale_enabled or self.boost_enabled:
-                                    await self.send_admin(
-                                        "⚠️ <b>لا يمكن تفعيل الوضع السريع ⚡ الآن:</b>\n"
-                                        "يجب أولاً إيقاف <b>(التدبيل)</b> و<b>(التعزيز)</b> من لوحة التحكم ليعمل الوضع السريع بالمبلغ الأساسي فقط."
-                                    )
-                                    continue
-                                self.fast_mode = True
-                                log("FAST_MODE", "تم تفعيل الوضع السريع ⚡🟢")
-                            else:
-                                self.fast_mode = False
-                                log("FAST_MODE", "تم إيقاف الوضع السريع ⚡🔴")
+                            self.fast_mode = not self.fast_mode
+                            log("FAST_MODE", f"حالة الوضع السريع: {'مفعّل 🟢' if self.fast_mode else 'متوقف 🔴'}")
                         elif data == "toggle_martingale":
                             self.martingale_enabled = not self.martingale_enabled
-                            if self.martingale_enabled and self.fast_mode:
-                                self.fast_mode = False
-                                log("FAST_MODE", "تم إيقاف الوضع السريع تلقائيًا لتفعيل التدبيل")
                             if not self.martingale_enabled:
                                 self.global_step_index = 0
                                 self.pending_martingale_steps.clear()
@@ -953,9 +940,6 @@ class AboodControlBot:
                             continue
                         elif data == "toggle_boost":
                             self.boost_enabled = not self.boost_enabled
-                            if self.boost_enabled and self.fast_mode:
-                                self.fast_mode = False
-                                log("FAST_MODE", "تم إيقاف الوضع السريع تلقائيًا لتفعيل التعزيز")
                             if not self.boost_enabled:
                                 self.reset_boost_state()
                             log("BOOST", f"حالة وضع التعزيز: {'مفعّل 🟢' if self.boost_enabled else 'متوقف 🔴'}")
@@ -1611,7 +1595,8 @@ class AboodControlBot:
                         )
                         self.enqueue_signal_reply(sig_uid, win_msg)
 
-                        self.global_step_index = 0
+                        if not any(t["g_idx"] > 0 for t in self.active_trades):
+                            self.global_step_index = 0
                         self.current_cycle_spent = 0.0
 
                         if self.boost_enabled and self.in_boost_recovery:
@@ -1664,7 +1649,6 @@ class AboodControlBot:
                         continue
 
                     # ج) حالة الخسارة (LOSS)
-                    # إذا كان التدبيل متوقفًا (أو في الوضع السريع) -> تسجيل الخسارة وإهمال الصفقة فورًا
                     if not self.martingale_enabled:
                         self.record_trade_outcome(sig_sym, is_win=False, attempt_num=1)
                         loss_msg = (
@@ -1822,8 +1806,10 @@ class AboodControlBot:
                             if self.martingale_enabled:
                                 if self.pending_martingale_steps:
                                     step_to_use = self.pending_martingale_steps.pop(0)
-                                else:
+                                elif not any(t["g_idx"] > 0 for t in self.active_trades):
                                     step_to_use = self.global_step_index
+                                else:
+                                    step_to_use = 0
                             else:
                                 step_to_use = 0
 
@@ -1862,7 +1848,7 @@ class AboodControlBot:
         self.print_five_candles(asset, force=force_print)
 
         # في الوضع العادي: نلتقط الفرص فقط إذا لم تكن هناك صفقات نشطة
-        # في الوضع السريع (fast_mode): نلتقط الفرص حتى أثناء وجود صفقات نشطة
+        # في الوضع السريع (fast_mode): نلتقط الفرص حتى أثناء وجود صفقات نشطة والتدبيل
         can_capture_more = (
             len(self.locked_candidates) < self.max_locked_pairs
             and (self.fast_mode or not self.active_trades)
