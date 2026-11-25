@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -41,6 +42,7 @@ DEFAULT_AUTH_FRAME = os.getenv(
 
 ACCOUNTS_FILE = "accounts.json"
 STATE_FILE = "bot_state.json"
+LOCAL_PW_BROWSERS_DIR = os.path.abspath(".pw-browsers")
 
 FALLBACK_CURRENCIES = [
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
@@ -164,6 +166,47 @@ def extract_session_and_uid_from_text(html_text: str) -> tuple[str, str]:
     return sess, uid
 
 
+def find_existing_chromium_executable() -> str | None:
+    search_roots = [
+        LOCAL_PW_BROWSERS_DIR,
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+        "/opt/render/.cache/ms-playwright",
+        "/opt/render/project/src/.pw-browsers",
+        os.path.expanduser("~/.cache/ms-playwright"),
+    ]
+    for root in search_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            if "chrome" in filenames:
+                exe = os.path.join(dirpath, "chrome")
+                if os.path.isfile(exe) and os.access(exe, os.X_OK):
+                    return exe
+            if "headless_shell" in filenames:
+                exe = os.path.join(dirpath, "headless_shell")
+                if os.path.isfile(exe) and os.access(exe, os.X_OK):
+                    return exe
+    return None
+
+
+def install_chromium_to_local_dir() -> str | None:
+    os.makedirs(LOCAL_PW_BROWSERS_DIR, exist_ok=True)
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = LOCAL_PW_BROWSERS_DIR
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=240
+        )
+    except Exception as e:
+        log("PW_INSTALL_ERR", f"تعذر تثبيت Chromium تلقائيًا: {e}")
+    return find_existing_chromium_executable()
+
+
 # ==========================================
 # دوال حساب المؤشرات الفنية (بدون مكتبات خارجية)
 # ==========================================
@@ -243,7 +286,7 @@ class AboodControlBot:
 
         # الشطرنج الشديد: اشتراط أن يكون حجم جسم كل شمعة من الشموع الخمس >= الحد المرجعي
         self.strict_chess_enabled = False
-        self.strict_body_ratio = 0.75        # نسبة من متوسط أجسام الشموع السابقة
+        self.strict_body_ratio = 0.75
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
@@ -256,7 +299,7 @@ class AboodControlBot:
         self.limits_enabled = False
         self.profit_limit = 50.0
         self.loss_limit = 50.0
-        self.limit_start_balance = None      # الرصيد المجلب عند ضغط بدء التداول
+        self.limit_start_balance = None
 
         # ==========================================
         # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
@@ -294,7 +337,7 @@ class AboodControlBot:
         # نظام التعزيز الذكي (يعتمد على الرصيد الفعلي وقمته دون أي تهبيش)
         # ==========================================
         self.boost_enabled = False
-        self.boost_mode = "CAPITAL"          # "CAPITAL" = العودة للقمة الفعلية للرصيد | "TRADES" = عدد صفقات ناجحة
+        self.boost_mode = "CAPITAL"
         self.boost_increment = 10.0
         self.boost_target_wins = 5
         self.boost_wins_done = 0
@@ -392,7 +435,6 @@ class AboodControlBot:
     # محرك فحص حدود الربح والخسارة وتحديث الرصيد والقمة
     # ==========================================
     def capture_start_balance_on_run(self):
-        """يضبط رصيد البداية عند الضغط على بدء التداول"""
         if self.account_balance is not None:
             bal = float(self.account_balance)
             self.limit_start_balance = bal
@@ -402,7 +444,6 @@ class AboodControlBot:
             self.limit_start_balance = None
 
     def update_balance_and_peak(self, new_bal: float) -> bool:
-        """يحدّث الرصيد الفعلي وقمته ويعود للتعزيز عند بلوغ القمة دون أي تهبيش"""
         self.account_balance = float(new_bal)
 
         if self.peak_balance is None:
@@ -420,7 +461,6 @@ class AboodControlBot:
         return self.check_and_enforce_limits(float(new_bal))
 
     def check_and_enforce_limits(self, current_bal: float) -> bool:
-        """يقارن الرصيد الحالي بالرصيد المجلب عند بدء التداول ويوقف البوت فورًا عند تحقق حد الربح أو الخسارة"""
         if not self.is_running or not self.limits_enabled:
             return False
 
@@ -467,7 +507,6 @@ class AboodControlBot:
     # فحص «الشطرنج الشديد» (أجسام شموع واضحة وغير هامشية)
     # ==========================================
     def check_strict_chess_candles(self, asset: str, minutes_tuple: tuple) -> tuple[bool, str]:
-        """يتحقق أن أجسام الشموع الخمسة في النموذج >= حجم مرجعي واضح لتفادي الشموع الهامشية الصغيرة"""
         if not self.strict_chess_enabled:
             return True, "عادي"
 
@@ -476,7 +515,6 @@ class AboodControlBot:
         if len(sorted_mins) < 10:
             return False, "شموع تاريخية غير كافية للشطرنج الشديد"
 
-        # حساب متوسط أجسام الشموع السابقة (قبل الشموع الخمس الحالية)
         prev_mins = [m for m in sorted_mins if m < minutes_tuple[0]][-20:]
         if not prev_mins:
             prev_mins = sorted_mins[:-5][-15:]
@@ -1475,6 +1513,25 @@ class AboodControlBot:
             return None
         return self.srv_login_last_input
 
+    async def _launch_server_chromium(self, pw):
+        launch_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-zygote",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1280,800",
+        ]
+        exe_path = find_existing_chromium_executable()
+        if not exe_path:
+            await self.send_admin("📦 <b>تجهيز متصفح السيرفر لأول مرة...</b> يُرجى الانتظار لحظات.")
+            exe_path = await asyncio.to_thread(install_chromium_to_local_dir)
+
+        if exe_path:
+            return await pw.chromium.launch(executable_path=exe_path, headless=True, args=launch_args)
+        return await pw.chromium.launch(headless=True, args=launch_args)
+
     async def run_server_browser_login(self, acc_name: str, login_method: str):
         if async_playwright is None:
             await self.send_admin(
@@ -1496,20 +1553,7 @@ class AboodControlBot:
             )
 
             pw = await async_playwright().start()
-            launch_args = [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-zygote",
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1280,800",
-            ]
-            try:
-                browser = await pw.chromium.launch(headless=True, args=launch_args)
-            except Exception:
-                # محاولة تشغيل متصفح النظام المثبت في البيئة إذا لزم الأمر
-                browser = await pw.chromium.launch(headless=True, channel="chromium", args=launch_args)
+            browser = await self._launch_server_chromium(pw)
 
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
