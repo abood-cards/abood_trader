@@ -3,7 +3,6 @@ import inspect
 import json
 import os
 import re
-import secrets
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -90,6 +89,10 @@ def candle_color(open_price: float, close_price: float) -> str:
     if close_price >= open_price:
         return "GREEN"
     return "RED"
+
+
+def candle_body_size(candle: dict) -> float:
+    return abs(float(candle["close"]) - float(candle["open"]))
 
 
 def color_label(color: str) -> str:
@@ -238,6 +241,10 @@ class AboodControlBot:
         # الوضع السريع (Turbo Mode)
         self.fast_mode = False
 
+        # الشطرنج الشديد: اشتراط أن يكون حجم جسم كل شمعة من الشموع الخمس >= الحد المرجعي
+        self.strict_chess_enabled = False
+        self.strict_body_ratio = 0.75        # نسبة من متوسط أجسام الشموع السابقة
+
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
         self.max_concurrent_trades = 1
@@ -249,7 +256,7 @@ class AboodControlBot:
         self.limits_enabled = False
         self.profit_limit = 50.0
         self.loss_limit = 50.0
-        self.limit_start_balance = None
+        self.limit_start_balance = None      # الرصيد المجلب عند ضغط بدء التداول
 
         # ==========================================
         # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
@@ -284,10 +291,10 @@ class AboodControlBot:
         self.srv_login_cancel = False
 
         # ==========================================
-        # نظام التعزيز الذكي (يُطبَّق على الصفقات الجديدة فقط دون المساس بالصفقات الجارية)
+        # نظام التعزيز الذكي (يعتمد على الرصيد الفعلي وقمته دون أي تهبيش)
         # ==========================================
         self.boost_enabled = False
-        self.boost_mode = "CAPITAL"
+        self.boost_mode = "CAPITAL"          # "CAPITAL" = العودة للقمة الفعلية للرصيد | "TRADES" = عدد صفقات ناجحة
         self.boost_increment = 10.0
         self.boost_target_wins = 5
         self.boost_wins_done = 0
@@ -362,6 +369,7 @@ class AboodControlBot:
                 self.limits_enabled = bool(st.get("limits_enabled", False))
                 self.profit_limit = float(st.get("profit_limit", 50.0))
                 self.loss_limit = float(st.get("loss_limit", 50.0))
+                self.strict_chess_enabled = bool(st.get("strict_chess_enabled", False))
         except Exception as e:
             log("STATE_WARN", f"تعذر قراءة ملف الحالة: {e}")
 
@@ -375,20 +383,44 @@ class AboodControlBot:
                     "limits_enabled": self.limits_enabled,
                     "profit_limit": self.profit_limit,
                     "loss_limit": self.loss_limit,
+                    "strict_chess_enabled": self.strict_chess_enabled,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log("STATE_WARN", f"تعذر حفظ ملف الحالة: {e}")
 
     # ==========================================
-    # محرك فحص حدود الربح والخسارة
+    # محرك فحص حدود الربح والخسارة وتحديث الرصيد والقمة
     # ==========================================
-    def reset_limit_baseline(self):
+    def capture_start_balance_on_run(self):
+        """يضبط رصيد البداية عند الضغط على بدء التداول"""
         if self.account_balance is not None:
-            self.limit_start_balance = float(self.account_balance)
+            bal = float(self.account_balance)
+            self.limit_start_balance = bal
+            if self.peak_balance is None or bal > self.peak_balance:
+                self.peak_balance = bal
         else:
             self.limit_start_balance = None
 
+    def update_balance_and_peak(self, new_bal: float) -> bool:
+        """يحدّث الرصيد الفعلي وقمته ويعود للتعزيز عند بلوغ القمة دون أي تهبيش"""
+        self.account_balance = float(new_bal)
+
+        if self.peak_balance is None:
+            self.peak_balance = float(new_bal)
+        elif float(new_bal) >= self.peak_balance:
+            self.peak_balance = float(new_bal)
+            if self.boost_enabled and self.in_boost_recovery and self.boost_mode == "CAPITAL":
+                log("BOOST_DONE", f"🎉 عاد الرصيد الفعلي إلى القمة (${format_money(self.peak_balance)})! العودة للأساسي ${self.base_amount:g}")
+                asyncio.create_task(self.send_admin(
+                    f"🎉 <b>عاد رصيد الحساب الفعلي إلى القمة (${format_money(self.peak_balance)})!</b>\n"
+                    f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                ))
+                self.reset_boost_state(reset_peak=False)
+
+        return self.check_and_enforce_limits(float(new_bal))
+
     def check_and_enforce_limits(self, current_bal: float) -> bool:
+        """يقارن الرصيد الحالي بالرصيد المجلب عند بدء التداول ويوقف البوت فورًا عند تحقق حد الربح أو الخسارة"""
         if not self.is_running or not self.limits_enabled:
             return False
 
@@ -399,30 +431,30 @@ class AboodControlBot:
         start_b = self.limit_start_balance
         diff = float(current_bal) - start_b
 
-        if self.profit_limit > 0 and diff >= (self.profit_limit - 0.001):
+        if self.profit_limit > 0 and diff >= (self.profit_limit - 1e-6):
             self.is_running = False
             self.full_reset_to_scanning("الوصول إلى حد الربح")
             self.limit_start_balance = None
             log("LIMIT_PROFIT", f"🎯 تم الوصول إلى حد الربح! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (+${format_money(diff)})")
             asyncio.create_task(self.send_admin(
-                f"🎯 <b>تم الوصول إلى حد الربح المحدد — تم إيقاف التداول تلقائيًا ✅</b>\n"
+                f"🎯 <b>تم الوصول إلى حد الربح — تم إيقاف التداول والصفقات فورًا ✅</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>رصيد البداية:</b> <code>${format_money(start_b)}</code>\n"
+                f"💰 <b>رصيد بدء التداول:</b> <code>${format_money(start_b)}</code>\n"
                 f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
-                f"📈 <b>الربح المحقق:</b> <code>+${format_money(diff)}</code> (الحد: <code>${format_money(self.profit_limit)}</code>)",
+                f"📈 <b>الربح المحقق:</b> <code>+${format_money(diff)}</code> (الحد: <code>+${format_money(self.profit_limit)}</code>)",
                 self.build_main_keyboard()
             ))
             return True
 
-        if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 0.001):
+        if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 1e-6):
             self.is_running = False
             self.full_reset_to_scanning("الوصول إلى حد الخسارة")
             self.limit_start_balance = None
             log("LIMIT_LOSS", f"🛑 تم الوصول إلى حد الخسارة! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (-${format_money(abs(diff))})")
             asyncio.create_task(self.send_admin(
-                f"🛑 <b>تم الوصول إلى حد الخسارة المحدد — تم إيقاف التداول تلقائيًا ⚠️</b>\n"
+                f"🛑 <b>تم الوصول إلى حد الخسارة — تم إيقاف التداول والصفقات فورًا ⚠️</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>رصيد البداية:</b> <code>${format_money(start_b)}</code>\n"
+                f"💰 <b>رصيد بدء التداول:</b> <code>${format_money(start_b)}</code>\n"
                 f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
                 f"📉 <b>الخسارة المسجلة:</b> <code>-${format_money(abs(diff))}</code> (الحد: <code>${format_money(self.loss_limit)}</code>)",
                 self.build_main_keyboard()
@@ -430,6 +462,41 @@ class AboodControlBot:
             return True
 
         return False
+
+    # ==========================================
+    # فحص «الشطرنج الشديد» (أجسام شموع واضحة وغير هامشية)
+    # ==========================================
+    def check_strict_chess_candles(self, asset: str, minutes_tuple: tuple) -> tuple[bool, str]:
+        """يتحقق أن أجسام الشموع الخمسة في النموذج >= حجم مرجعي واضح لتفادي الشموع الهامشية الصغيرة"""
+        if not self.strict_chess_enabled:
+            return True, "عادي"
+
+        pair_candles = self.candles.get(asset, {})
+        sorted_mins = sorted(pair_candles.keys())
+        if len(sorted_mins) < 10:
+            return False, "شموع تاريخية غير كافية للشطرنج الشديد"
+
+        # حساب متوسط أجسام الشموع السابقة (قبل الشموع الخمس الحالية)
+        prev_mins = [m for m in sorted_mins if m < minutes_tuple[0]][-20:]
+        if not prev_mins:
+            prev_mins = sorted_mins[:-5][-15:]
+
+        prev_bodies = [candle_body_size(pair_candles[m]) for m in prev_mins if candle_body_size(pair_candles[m]) > 0]
+        if not prev_bodies:
+            return False, "لا توجد أجسام شموع واضحة للمقارنة"
+
+        avg_body = sum(prev_bodies) / len(prev_bodies)
+        min_required_body = avg_body * self.strict_body_ratio
+
+        for idx, m in enumerate(minutes_tuple, start=1):
+            c_obj = pair_candles.get(m)
+            if not c_obj:
+                return False, f"بيانات الشمعة #{idx} مفقودة"
+            b_size = candle_body_size(c_obj)
+            if b_size < min_required_body:
+                return False, f"شمعة #{idx} صغيرة/هامشية ({b_size:.5f} < {min_required_body:.5f})"
+
+        return True, "شموع قوية ومطابقة ✅"
 
     # ==========================================
     # محرك تقييم المؤشرات والفلاتر (بشروط متوسطة)
@@ -871,7 +938,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز
+    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز + الشطرنج الشديد
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -888,6 +955,11 @@ class AboodControlBot:
             {"text": "🎯 الحدود: مفعّل 🟢", "callback_data": "toggle_limits_master"}
             if self.limits_enabled
             else {"text": "🎯 الحدود: متوقف 🔴", "callback_data": "toggle_limits_master"}
+        )
+        strict_chess_btn = (
+            {"text": "⚔️ الشطرنج الشديد: مفعّل 🟢", "callback_data": "toggle_strict_chess"}
+            if self.strict_chess_enabled
+            else {"text": "⚔️ الشطرنج الشديد: متوقف 🔴", "callback_data": "toggle_strict_chess"}
         )
         ind_master_btn = (
             {"text": "📊 المؤشرات: مفعّل 🟢", "callback_data": "toggle_indicators_master"}
@@ -923,8 +995,8 @@ class AboodControlBot:
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
                 [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
+                [strict_chess_btn, {"text": f"🔭 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
-                [{"text": f"🔭 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [
                     {"text": dual_label, "callback_data": "set_dual_pairs"},
                     {"text": trades_label, "callback_data": "set_concurrent_trades"}
@@ -982,7 +1054,7 @@ class AboodControlBot:
         }
 
     def format_limits_menu_text(self) -> str:
-        en_str = "🟢 <b>مفعّل</b> (يتوقف البوت تلقائيًا عند بلوغ أحد الحدين)" if self.limits_enabled else "🔴 <b>متوقف</b>"
+        en_str = "🟢 <b>مفعّل</b> (يوقف البوت والصفقات فورًا عند بلوغ أحد الحدين)" if self.limits_enabled else "🔴 <b>متوقف</b>"
         bal_str = f"${format_money(self.account_balance)}" if self.account_balance is not None else "غير متاح"
 
         if self.limit_start_balance is not None:
@@ -1004,7 +1076,7 @@ class AboodControlBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة العامة:</b> {en_str}\n"
             f"💰 <b>الرصيد الحالي:</b> <code>{bal_str}</code>\n"
-            f"📍 <b>رصيد نقطة البداية:</b> <code>{start_str}</code>\n"
+            f"📍 <b>رصيد بدء التداول:</b> <code>{start_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📈 <b>حد الربح:</b> <code>+${self.profit_limit:g}</code> ⬅️ يتوقف عند: <b>{target_profit_str}</b>\n"
             f"📉 <b>حد الخسارة:</b> <code>-${self.loss_limit:g}</code> ⬅️ يتوقف عند: <b>{target_loss_str}</b>\n"
@@ -1019,7 +1091,7 @@ class AboodControlBot:
             else {"text": "🛡️ حالة التعزيز: متوقف 🔴", "callback_data": "boost_toggle_enable"}
         )
         mode_btn = (
-            {"text": "🎯 نوع التعزيز: تعويض القمة 💰", "callback_data": "boost_toggle_mode"}
+            {"text": "🎯 نوع التعزيز: العودة لقمة الرصيد 💰", "callback_data": "boost_toggle_mode"}
             if self.boost_mode == "CAPITAL"
             else {"text": "🎯 نوع التعزيز: عدد صفقات ناجحة 🏆", "callback_data": "boost_toggle_mode"}
         )
@@ -1044,7 +1116,7 @@ class AboodControlBot:
     def format_boost_menu_text(self) -> str:
         en_str = "🟢 <b>مفعّل</b>" if self.boost_enabled else "🔴 <b>متوقف</b>"
         mode_str = (
-            "💰 <b>تعويض رأس المال إلى القمة</b> (يستمر بالتعزيز حتى يعود الرصيد لأعلى قمة وصل إليها)"
+            "💰 <b>العودة لقمة الرصيد الفعلية</b> (يراقب الرصيد الفعلي ويعود للأساسي عند الوصول لأعلى قمة وصل لها)"
             if self.boost_mode == "CAPITAL"
             else f"🏆 <b>عدد صفقات ناجحة محددة</b> (يستمر بالتعزيز حتى يحقق <b>{self.boost_target_wins}</b> صفقات رابحة)"
         )
@@ -1053,7 +1125,7 @@ class AboodControlBot:
 
         if self.in_boost_recovery:
             if self.boost_mode == "CAPITAL":
-                prog = f"🔥 <b>نشط الآن (للصفقات الجديدة)</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | الرصيد: <code>{bal_str}</code> / الهدف: <code>{peak_str}</code>"
+                prog = f"🔥 <b>نشط الآن (للصفقات الجديدة)</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | الرصيد الفعلي: <code>{bal_str}</code> / القمة: <code>{peak_str}</code>"
             else:
                 prog = f"🔥 <b>نشط الآن (للصفقات الجديدة)</b> | الأساسي المعزّز: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code> صفقات"
         else:
@@ -1066,7 +1138,7 @@ class AboodControlBot:
             f"🎯 <b>نظام التعزيز:</b> {mode_str}\n"
             f"➕ <b>مقدار الزيادة الواحدة:</b> <code>+${self.boost_increment:g}</code> (تبدأ من الصفقات الجديدة فقط)\n"
             f"🏆 <b>عدد الصفقات المستهدفة:</b> <code>{self.boost_target_wins} صفقات ناجحة</code>\n"
-            f"🏔 <b>قمة رأس المال المسجلة:</b> <code>{peak_str}</code>\n"
+            f"🏔 <b>قمة الرصيد المسجلة:</b> <code>{peak_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>الوضع الحالي:</b> {prog}"
         )
@@ -1200,6 +1272,8 @@ class AboodControlBot:
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
         turnover_str = format_money(self.total_turnover)
 
+        strict_str = "🟢 مفعّل (شموع واضحة وقوية)" if self.strict_chess_enabled else "🔴 متوقف"
+
         if self.limits_enabled:
             if self.limit_start_balance is not None:
                 p_goal = f"${format_money(self.limit_start_balance + self.profit_limit)}" if self.profit_limit > 0 else "—"
@@ -1221,9 +1295,9 @@ class AboodControlBot:
             if self.boost_mode == "CAPITAL":
                 peak_txt = f"${format_money(self.peak_balance)}" if self.peak_balance is not None else "—"
                 if self.in_boost_recovery:
-                    boost_status = f"🟢 مفعّل [تعويض القمة] (للجديدة: <b>${self.effective_base_amount:g}</b> | الهدف: <code>{peak_txt}</code>)"
+                    boost_status = f"🟢 مفعّل [قمة الرصيد] (للجديدة: <b>${self.effective_base_amount:g}</b> | القمة: <code>{peak_txt}</code>)"
                 else:
-                    boost_status = f"🟢 مفعّل [تعويض القمة] (+${self.boost_increment:g} | القمة: <code>{peak_txt}</code>)"
+                    boost_status = f"🟢 مفعّل [قمة الرصيد] (+${self.boost_increment:g} | القمة: <code>{peak_txt}</code>)"
             else:
                 if self.in_boost_recovery:
                     boost_status = f"🟢 مفعّل [عدد صفقات] (للجديدة: <b>${self.effective_base_amount:g}</b> | المنجز: <code>{self.boost_wins_done}/{self.boost_target_wins}</code>)"
@@ -1262,6 +1336,7 @@ class AboodControlBot:
             f"💵 <b>عائد التداول (Turnover):</b> <code>${turnover_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>الحدود (ربح/خسارة):</b> {limits_status}\n"
+            f"⚔️ <b>الشطرنج الشديد:</b> {strict_str}\n"
             f"🔭 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
             f"📊 <b>المؤشرات والفلاتر:</b> {self.get_active_indicators_summary()}\n"
             f"👯 <b>المزدوج / الصفقات:</b> يمسك <code>{self.max_locked_pairs}</code> عملات | يدخل <code>{self.max_concurrent_trades}</code> صفقات\n"
@@ -1404,7 +1479,7 @@ class AboodControlBot:
         if async_playwright is None:
             await self.send_admin(
                 "⚠️ مكتبة <code>playwright</code> غير مثبتة على السيرفر بعد.\n"
-                "أضف <code>playwright==1.49.1</code> في <code>requirements.txt</code> و <code>playwright install chromium</code> في أمر البناء على Render."
+                "أضف <code>playwright</code> في <code>requirements.txt</code> و <code>playwright install chromium</code> في أمر البناء على Render."
             )
             return
 
@@ -1421,19 +1496,21 @@ class AboodControlBot:
             )
 
             pw = await async_playwright().start()
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-zygote",
-                    "--single-process",
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-size=1280,800",
-                ]
-            )
+            launch_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,800",
+            ]
+            try:
+                browser = await pw.chromium.launch(headless=True, args=launch_args)
+            except Exception:
+                # محاولة تشغيل متصفح النظام المثبت في البيئة إذا لزم الأمر
+                browser = await pw.chromium.launch(headless=True, channel="chromium", args=launch_args)
+
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent=(
@@ -1661,9 +1738,6 @@ class AboodControlBot:
                             break
                         await page.wait_for_timeout(1500)
 
-            # ==================================================
-            # مرحلة الربط التلقائي للديمو والحقيقي داخل المتصفح
-            # ==================================================
             if self.srv_login_cancel:
                 return
 
@@ -1751,9 +1825,10 @@ class AboodControlBot:
         except asyncio.CancelledError:
             log("SRV_AUTH", "تم إلغاء جلسة الربط على السيرفر.")
         except Exception as e:
-            log("SRV_AUTH_ERR", f"خطأ أثناء الربط عبر السيرفر: {e}")
+            err_short = str(e).splitlines()[0][:160] if str(e) else type(e).__name__
+            log("SRV_AUTH_ERR", f"خطأ أثناء الربط عبر السيرفر: {err_short}")
             await self.send_admin(
-                "⚠️ حدث خطأ أثناء الاتصال بالمنصة على السيرفر. حاول مرة أخرى.",
+                f"⚠️ حدث خطأ أثناء الاتصال بالمنصة على السيرفر:\n<code>{err_short}</code>",
                 self.build_accounts_keyboard()
             )
         finally:
@@ -1883,20 +1958,25 @@ class AboodControlBot:
                             self.is_running = True
                             self.awaiting_input = None
                             if self.limits_enabled:
-                                self.reset_limit_baseline()
+                                self.capture_start_balance_on_run()
                             log("CTRL", "تم تشغيل البوت من لوحة الإدارة ▶️")
                         elif data == "cmd_stop":
                             self.is_running = False
                             self.awaiting_input = None
+                            self.limit_start_balance = None
                             self.full_reset_to_scanning("إيقاف من لوحة الإدارة")
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "toggle_strict_chess":
+                            self.strict_chess_enabled = not self.strict_chess_enabled
+                            self._save_bot_state()
+                            log("STRICT_CHESS", f"حالة الشطرنج الشديد: {'مفعّل 🟢' if self.strict_chess_enabled else 'متوقف 🔴'}")
                         elif data == "toggle_limits_master":
                             self.limits_enabled = not self.limits_enabled
-                            if self.limits_enabled:
-                                self.reset_limit_baseline()
-                            else:
+                            if self.limits_enabled and self.is_running:
+                                self.capture_start_balance_on_run()
+                            elif not self.limits_enabled:
                                 self.limit_start_balance = None
                             self._save_bot_state()
                             log("LIMITS", f"حالة الحدود (ربح/خسارة): {'مفعّل 🟢' if self.limits_enabled else 'متوقف 🔴'}")
@@ -1911,9 +1991,9 @@ class AboodControlBot:
                             continue
                         elif data == "limits_toggle_enable":
                             self.limits_enabled = not self.limits_enabled
-                            if self.limits_enabled:
-                                self.reset_limit_baseline()
-                            else:
+                            if self.limits_enabled and self.is_running:
+                                self.capture_start_balance_on_run()
+                            elif not self.limits_enabled:
                                 self.limit_start_balance = None
                             self._save_bot_state()
                             await self.tg_api("editMessageText", {
@@ -1925,7 +2005,7 @@ class AboodControlBot:
                             })
                             continue
                         elif data == "limits_reset_base":
-                            self.reset_limit_baseline()
+                            self.capture_start_balance_on_run()
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
                                 "message_id": msg_id,
@@ -2345,12 +2425,16 @@ class AboodControlBot:
                                 val = float(text.replace("$", ""))
                                 if val >= 0:
                                     self.profit_limit = val
+                                    if self.limits_enabled and self.is_running and self.limit_start_balance is None:
+                                        self.capture_start_balance_on_run()
                                     self._save_bot_state()
                                     self.awaiting_input = None
                                     await self.send_admin(
                                         f"✅ تم ضبط <b>حد الربح</b> إلى <b>+${val:g}</b>.",
                                         self.build_limits_keyboard()
                                     )
+                                    if self.account_balance is not None:
+                                        self.check_and_enforce_limits(float(self.account_balance))
                                 else:
                                     await self.send_admin("⚠️ أدخل رقمًا أكبر من أو يساوي 0:")
                             except ValueError:
@@ -2361,12 +2445,16 @@ class AboodControlBot:
                                 val = float(text.replace("$", ""))
                                 if val >= 0:
                                     self.loss_limit = val
+                                    if self.limits_enabled and self.is_running and self.limit_start_balance is None:
+                                        self.capture_start_balance_on_run()
                                     self._save_bot_state()
                                     self.awaiting_input = None
                                     await self.send_admin(
                                         f"✅ تم ضبط <b>حد الخسارة</b> إلى <b>-${val:g}</b>.",
                                         self.build_limits_keyboard()
                                     )
+                                    if self.account_balance is not None:
+                                        self.check_and_enforce_limits(float(self.account_balance))
                                 else:
                                     await self.send_admin("⚠️ أدخل رقمًا أكبر من أو يساوي 0:")
                             except ValueError:
@@ -2895,6 +2983,10 @@ class AboodControlBot:
                 await asyncio.sleep(0.05)
                 continue
 
+            if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+                await asyncio.sleep(0.05)
+                continue
+
             server_now = self.get_server_now()
 
             deadlines = []
@@ -2919,6 +3011,8 @@ class AboodControlBot:
                 due_trades = [t for t in self.active_trades if (t["close_ts"] - server_now) <= self.entry_lead_seconds]
 
                 for trade in due_trades:
+                    if not self.is_running:
+                        break
                     if trade in self.active_trades:
                         self.active_trades.remove(trade)
 
@@ -2961,33 +3055,17 @@ class AboodControlBot:
                             self.global_step_index = 0
                         self.current_cycle_spent = 0.0
 
-                        if self.boost_enabled and self.in_boost_recovery:
-                            if self.boost_mode == "TRADES":
-                                self.boost_wins_done += 1
-                                if self.boost_wins_done >= self.boost_target_wins:
-                                    log("BOOST_DONE", f"🎉 اكتملت صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})! العودة للأساسي ${self.base_amount:g}")
-                                    asyncio.create_task(self.send_admin(
-                                        f"🎉 <b>اكتمل عدد صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})!</b>\n"
-                                        f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
-                                    ))
-                                    self.reset_boost_state(reset_peak=False)
-                                else:
-                                    log("BOOST_PROG", f"🛡️ تقدم التعزيز: تم إنجاز {self.boost_wins_done}/{self.boost_target_wins} صفقات ناجحة")
-
-                            elif self.boost_mode == "CAPITAL":
-                                payout_pct = self.payouts.get(asset, self.min_payout)
-                                if self.account_balance is not None and self.peak_balance is not None:
-                                    projected_bal = float(self.account_balance) + won_amount * (1.0 + payout_pct / 100.0)
-                                    if projected_bal >= (self.peak_balance - 0.01):
-                                        self.peak_balance = max(self.peak_balance, projected_bal)
-                                        log("BOOST_DONE", f"🎉 وصل رأس المال للقمة (${format_money(self.peak_balance)})! العودة للأساسي ${self.base_amount:g}")
-                                        asyncio.create_task(self.send_admin(
-                                            f"🎉 <b>تم تعويض رأس المال والعودة إلى القمة (${format_money(self.peak_balance)})!</b>\n"
-                                            f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
-                                        ))
-                                        self.reset_boost_state(reset_peak=False)
-                                    else:
-                                        log("BOOST_PROG", f"🛡️ تقدم التعزيز نحو القمة: المتوقع ${format_money(projected_bal)} / الهدف ${format_money(self.peak_balance)}")
+                        if self.boost_enabled and self.in_boost_recovery and self.boost_mode == "TRADES":
+                            self.boost_wins_done += 1
+                            if self.boost_wins_done >= self.boost_target_wins:
+                                log("BOOST_DONE", f"🎉 اكتملت صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})! العودة للأساسي ${self.base_amount:g}")
+                                asyncio.create_task(self.send_admin(
+                                    f"🎉 <b>اكتمل عدد صفقات التعزيز الناجحة ({self.boost_wins_done}/{self.boost_target_wins})!</b>\n"
+                                    f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
+                                ))
+                                self.reset_boost_state(reset_peak=False)
+                            else:
+                                log("BOOST_PROG", f"🛡️ تقدم التعزيز: تم إنجاز {self.boost_wins_done}/{self.boost_target_wins} صفقات ناجحة")
 
                         if self.continuation_enabled and attempt_num == 1 and not is_cont:
                             eligible, _ = self.is_pair_eligible(asset)
@@ -3038,7 +3116,7 @@ class AboodControlBot:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
                             if self.peak_balance is None and self.account_balance is not None:
-                                self.peak_balance = float(self.account_balance) + self.current_cycle_spent
+                                self.peak_balance = float(self.account_balance)
                             self.effective_base_amount = self.base_amount + self.boost_increment
                             self._notify_boost_activated()
 
@@ -3062,7 +3140,7 @@ class AboodControlBot:
                             self.in_boost_recovery = True
                             self.boost_wins_done = 0
                             if self.peak_balance is None and self.account_balance is not None:
-                                self.peak_balance = float(self.account_balance) + self.current_cycle_spent
+                                self.peak_balance = float(self.account_balance)
                             self.effective_base_amount = self.base_amount + self.boost_increment
                             self._notify_boost_activated()
 
@@ -3098,7 +3176,7 @@ class AboodControlBot:
             # ========================================================
             # 2) فحص الأزواج المجهّزة في قائمة الانتظار
             # ========================================================
-            if self.locked_candidates:
+            if self.locked_candidates and self.is_running:
                 earliest_minute = min(c["target_minute"] for c in self.locked_candidates)
                 cand_remaining = (earliest_minute + 60.0 + SERVER_CLOCK_OFFSET) - server_now
 
@@ -3185,6 +3263,8 @@ class AboodControlBot:
                         self.locked_candidates.clear()
 
                         for cand in selected_to_enter:
+                            if not self.is_running:
+                                break
                             if self.martingale_enabled:
                                 if self.pending_martingale_steps:
                                     step_to_use, carried_base = self.pending_martingale_steps.pop(0)
@@ -3224,12 +3304,12 @@ class AboodControlBot:
             bal_txt = f"${format_money(self.account_balance)}" if self.account_balance is not None else "—"
             log(
                 "BOOST_UP",
-                f"🛡️ تفعيل التعزيز للصفقات الجديدة (تعويض القمة)! الأساسي المعزّز: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
+                f"🛡️ تفعيل التعزيز للصفقات الجديدة (قمة الرصيد)! الأساسي المعزّز: ${self.effective_base_amount:g} | الرصيد: {bal_txt} / القمة: {peak_txt}"
             )
             asyncio.create_task(self.send_admin(
-                f"🛡️ <b>تم تفعيل التعزيز للصفقات الجديدة (تعويض القمة)!</b>\n"
+                f"🛡️ <b>تم تفعيل التعزيز للصفقات الجديدة (قمة الرصيد)!</b>\n"
                 f"💵 المبلغ الأساسي الجديد: <b>${self.effective_base_amount:g}</b> (يُطبَّق على الصفقات الجديدة فقط)\n"
-                f"💰 الرصيد الحالي: <code>{bal_txt}</code> ⬅️ القمة المستهدفة: <code>{peak_txt}</code>"
+                f"💰 الرصيد الفعلي: <code>{bal_txt}</code> ⬅️ القمة المستهدفة: <code>{peak_txt}</code>"
             ))
         else:
             log(
@@ -3282,10 +3362,18 @@ class AboodControlBot:
             priority_line = f"┃ 🔢 الأولوية  <b>#{rank}</b>\n" if self.max_locked_pairs > 1 else ""
 
             if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
+                strict_ok, strict_reason = self.check_strict_chess_candles(asset, (m4, m3, m2, m1, m_open))
+                if not strict_ok:
+                    skip_sig = (m_open, "put", "STRICT", strict_reason)
+                    if self.last_ind_skip_log.get(asset) != skip_sig:
+                        self.last_ind_skip_log[asset] = skip_sig
+                        log("STRICT_CHESS", f"⚔️ تخطي نموذج بيع على {sig_sym}: {strict_reason}")
+                    return
+
                 if self.indicators_enabled:
                     ind_ok, ind_reason = self.check_indicators(asset, "put", is_pre_close=False)
                     if not ind_ok:
-                        skip_sig = (m_open, "put", ind_reason)
+                        skip_sig = (m_open, "put", "IND", ind_reason)
                         if self.last_ind_skip_log.get(asset) != skip_sig:
                             self.last_ind_skip_log[asset] = skip_sig
                             log("IND_FILTER", f"📊 تخطي نموذج بيع على {sig_sym} بسبب المؤشرات: {ind_reason}")
@@ -3318,10 +3406,18 @@ class AboodControlBot:
                 )
 
             elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
+                strict_ok, strict_reason = self.check_strict_chess_candles(asset, (m4, m3, m2, m1, m_open))
+                if not strict_ok:
+                    skip_sig = (m_open, "call", "STRICT", strict_reason)
+                    if self.last_ind_skip_log.get(asset) != skip_sig:
+                        self.last_ind_skip_log[asset] = skip_sig
+                        log("STRICT_CHESS", f"⚔️ تخطي نموذج شراء على {sig_sym}: {strict_reason}")
+                    return
+
                 if self.indicators_enabled:
                     ind_ok, ind_reason = self.check_indicators(asset, "call", is_pre_close=False)
                     if not ind_ok:
-                        skip_sig = (m_open, "call", ind_reason)
+                        skip_sig = (m_open, "call", "IND", ind_reason)
                         if self.last_ind_skip_log.get(asset) != skip_sig:
                             self.last_ind_skip_log[asset] = skip_sig
                             log("IND_FILTER", f"📊 تخطي نموذج شراء على {sig_sym} بسبب المؤشرات: {ind_reason}")
@@ -3369,24 +3465,9 @@ class AboodControlBot:
             msg_is_demo = data.get("isDemo")
             if msg_is_demo is None or bool(msg_is_demo) == self.is_demo_mode:
                 new_bal = float(data.get("balance", 0))
-                self.account_balance = new_bal
                 mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
                 log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${format_money(new_bal)}")
-
-                if self.check_and_enforce_limits(new_bal):
-                    return
-
-                if self.peak_balance is None:
-                    self.peak_balance = new_bal
-                elif new_bal >= self.peak_balance:
-                    self.peak_balance = new_bal
-                    if self.boost_enabled and self.in_boost_recovery and self.boost_mode == "CAPITAL":
-                        log("BOOST_DONE", f"🎉 وصل رصيد الحساب للقمة (${format_money(self.peak_balance)})! العودة للأساسي ${self.base_amount:g}")
-                        asyncio.create_task(self.send_admin(
-                            f"🎉 <b>تم تعويض رأس المال والعودة إلى القمة (${format_money(self.peak_balance)})!</b>\n"
-                            f"💵 عاد المبلغ الأساسي تلقائيًا إلى <b>${self.base_amount:g}</b>."
-                        ))
-                        self.reset_boost_state(reset_peak=False)
+                self.update_balance_and_peak(new_bal)
             return
 
         if event_name == "successopenOrder" and isinstance(data, dict):
