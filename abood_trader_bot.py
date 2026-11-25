@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -35,9 +36,16 @@ SERVER_CLOCK_OFFSET = 0.75
 # تأخير إضافي بأجزاء الثانية لضبط لحظة التدبيلة بدقة ومنع تقدمها ثانية كاملة
 MARTINGALE_OFFSET = 0.05
 
+# جلسة الديمو الافتراضية (تُقرأ من Render Environment Variables)
 DEFAULT_AUTH_FRAME = os.getenv(
     "PO_AUTH_FRAME",
     '42["auth",{"session":"et97hpjdhses78itun3rk2peld","isDemo":1,"uid":142271281,"platform":2,"isFastHistory":true,"isOptimized":true}]'
+)
+
+# جلسة الحساب الحقيقي الافتراضية (أضف PO_LIVE_AUTH_FRAME في متغيرات البيئة على Render)
+DEFAULT_LIVE_AUTH_FRAME = os.getenv(
+    "PO_LIVE_AUTH_FRAME",
+    ""
 )
 
 ACCOUNTS_FILE = "accounts.json"
@@ -284,9 +292,9 @@ class AboodControlBot:
         # الوضع السريع (Turbo Mode)
         self.fast_mode = False
 
-        # الشطرنج الشديد: اشتراط أن يكون حجم جسم كل شمعة من الشموع الخمس >= الحد المرجعي
+        # الشطرنج الشديد: يقبل الشموع الصغيرة ذات اللون الواضح ويستبعد الشموع المسطحة/الهامشية
         self.strict_chess_enabled = False
-        self.strict_body_ratio = 0.75
+        self.strict_body_ratio = 0.25        # 25% من وسيط أجسام الشموع السابقة
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
@@ -324,6 +332,7 @@ class AboodControlBot:
         self.is_demo_mode = True
         self.auth_frame = DEFAULT_AUTH_FRAME
         self.temp_new_acc_name = ""
+        self.temp_new_acc_demo_frame = ""
         self._load_accounts_storage()
 
         # متغيرات جلسة الربط المباشر عبر متصفح السيرفر (Playwright)
@@ -504,15 +513,19 @@ class AboodControlBot:
         return False
 
     # ==========================================
-    # فحص «الشطرنج الشديد» (أجسام شموع واضحة وغير هامشية)
+    # فحص «الشطرنج الشديد» (يشمل الشموع الصغيرة ذات اللون الواضح ويستبعد المسطحة)
     # ==========================================
     def check_strict_chess_candles(self, asset: str, minutes_tuple: tuple) -> tuple[bool, str]:
+        """
+        يقبل الشموع الصغيرة والكبيرة بشرط أن يظهر فيها جسم لوني واضح (أخضر/أحمر)
+        ويستبعد الشموع المسطحة أو شبه المعدومة الجسم (الدوجي الدقيق).
+        """
         if not self.strict_chess_enabled:
             return True, "عادي"
 
         pair_candles = self.candles.get(asset, {})
         sorted_mins = sorted(pair_candles.keys())
-        if len(sorted_mins) < 10:
+        if len(sorted_mins) < 8:
             return False, "شموع تاريخية غير كافية للشطرنج الشديد"
 
         prev_mins = [m for m in sorted_mins if m < minutes_tuple[0]][-20:]
@@ -521,20 +534,38 @@ class AboodControlBot:
 
         prev_bodies = [candle_body_size(pair_candles[m]) for m in prev_mins if candle_body_size(pair_candles[m]) > 0]
         if not prev_bodies:
-            return False, "لا توجد أجسام شموع واضحة للمقارنة"
+            return False, "لا توجد شموع مرجعية كافية"
 
-        avg_body = sum(prev_bodies) / len(prev_bodies)
-        min_required_body = avg_body * self.strict_body_ratio
+        # استخدام الوسيط (Median) بدل المتوسط حتى لا ترفع شمعة عملاقة الحد على الشموع الصغيرة الواضحة
+        median_body = statistics.median(prev_bodies)
+        min_median_threshold = median_body * self.strict_body_ratio
 
         for idx, m in enumerate(minutes_tuple, start=1):
             c_obj = pair_candles.get(m)
             if not c_obj:
                 return False, f"بيانات الشمعة #{idx} مفقودة"
-            b_size = candle_body_size(c_obj)
-            if b_size < min_required_body:
-                return False, f"شمعة #{idx} صغيرة/هامشية ({b_size:.5f} < {min_required_body:.5f})"
 
-        return True, "شموع قوية ومطابقة ✅"
+            o_p = float(c_obj["open"])
+            c_p = float(c_obj["close"])
+            h_p = float(c_obj.get("high", max(o_p, c_p)))
+            l_p = float(c_obj.get("low", min(o_p, c_p)))
+            b_size = abs(c_p - o_p)
+            total_range = max(h_p - l_p, b_size)
+
+            # 1) رفض الشمعة المسطحة تمامًا (خط أفقي بدون جسم)
+            if b_size <= 0:
+                return False, f"شمعة #{idx} مسطحة بدون جسم"
+
+            # 2) حد أدنى نسبي للسعر (يقبل الشموع الصغيرة الواضحة مثل 3 نقاط ويرفض 0-1 نقطة)
+            min_price_body = c_p * 0.000015
+            if b_size < min_price_body and b_size < min_median_threshold:
+                return False, f"شمعة #{idx} هامشية صغيرة جدًا"
+
+            # 3) وضوح اللون مقارنة بالذيل (ألا تكون دوجي خيطية بلا جسم مرئي)
+            if total_range > 0 and (b_size / total_range) < 0.14:
+                return False, f"شمعة #{idx} دوجي غير واضحة اللون"
+
+        return True, "شموع واضحة ومطابقة ✅"
 
     # ==========================================
     # محرك تقييم المؤشرات والفلاتر (بشروط متوسطة)
@@ -641,21 +672,55 @@ class AboodControlBot:
         return f"🟢 مفعّل ({joined})"
 
     # ==========================================
-    # إدارة الحسابات المتعددة والتخزين (ديمو + حقيقي لكل حساب)
+    # إدارة الحسابات المتعددة والتخزين (ديمو + حقيقي منفصلان لكل حساب)
     # ==========================================
     def _normalize_account_record(self, acc: dict) -> dict:
         base_frame = acc.get("demo_auth_frame") or acc.get("live_auth_frame") or acc.get("auth_frame") or DEFAULT_AUTH_FRAME
         parsed = parse_auth_frame(base_frame) or {}
         uid = str(acc.get("uid") or parsed.get("uid") or "000000")
         demo_f = acc.get("demo_auth_frame") or build_auth_frame_with_mode(base_frame, True)
-        live_f = acc.get("live_auth_frame") or build_auth_frame_with_mode(base_frame, False)
+        live_f = acc.get("live_auth_frame") or ""
+        has_dedicated_live = bool(acc.get("has_dedicated_live", False))
+        if live_f and demo_f:
+            d_p = parse_auth_frame(demo_f) or {}
+            l_p = parse_auth_frame(live_f) or {}
+            if l_p.get("session") and l_p.get("session") != d_p.get("session"):
+                has_dedicated_live = True
+        if not live_f:
+            live_f = build_auth_frame_with_mode(demo_f, False)
+
         return {
             "name": acc.get("name", f"حساب {uid}"),
             "uid": uid,
             "demo_auth_frame": demo_f,
             "live_auth_frame": live_f,
+            "has_dedicated_live": has_dedicated_live,
             "auth_frame": demo_f
         }
+
+    def _apply_env_default_frames(self):
+        """تحديث جلسة الديمو والحقيقي من متغيرات البيئة في Render (PO_AUTH_FRAME و PO_LIVE_AUTH_FRAME)"""
+        if not self.accounts:
+            return
+        env_demo = parse_auth_frame(DEFAULT_AUTH_FRAME)
+        env_live = parse_auth_frame(DEFAULT_LIVE_AUTH_FRAME) if DEFAULT_LIVE_AUTH_FRAME.strip() else None
+
+        target_uid = str((env_live or env_demo or {}).get("uid") or self.accounts[0]["uid"])
+        target_idx = 0
+        for idx, acc in enumerate(self.accounts):
+            if str(acc.get("uid")) == target_uid:
+                target_idx = idx
+                break
+
+        if env_demo and env_demo.get("session"):
+            self.accounts[target_idx]["demo_auth_frame"] = build_auth_frame_with_mode(DEFAULT_AUTH_FRAME, True)
+            self.accounts[target_idx]["uid"] = str(env_demo.get("uid", self.accounts[target_idx]["uid"]))
+
+        if env_live and env_live.get("session"):
+            self.accounts[target_idx]["live_auth_frame"] = build_auth_frame_with_mode(DEFAULT_LIVE_AUTH_FRAME, False)
+            self.accounts[target_idx]["has_dedicated_live"] = True
+            if not env_demo:
+                self.accounts[target_idx]["uid"] = str(env_live.get("uid", self.accounts[target_idx]["uid"]))
 
     def _load_accounts_storage(self):
         loaded = False
@@ -674,15 +739,18 @@ class AboodControlBot:
         if not loaded or not self.accounts:
             parsed = parse_auth_frame(DEFAULT_AUTH_FRAME) or {}
             uid = str(parsed.get("uid", "142271281"))
-            self.is_demo_mode = bool(parsed.get("isDemo", 1) == 1)
+            self.is_demo_mode = True
             self.accounts = [self._normalize_account_record({
                 "name": "الحساب الافتراضي",
                 "uid": uid,
-                "auth_frame": DEFAULT_AUTH_FRAME
+                "demo_auth_frame": build_auth_frame_with_mode(DEFAULT_AUTH_FRAME, True),
+                "live_auth_frame": build_auth_frame_with_mode(DEFAULT_LIVE_AUTH_FRAME, False) if DEFAULT_LIVE_AUTH_FRAME.strip() else "",
+                "has_dedicated_live": bool(DEFAULT_LIVE_AUTH_FRAME.strip())
             })]
             self.active_account_idx = 0
-            self._save_accounts_storage()
 
+        self._apply_env_default_frames()
+        self._save_accounts_storage()
         self._sync_active_auth_frame()
 
     def _save_accounts_storage(self):
@@ -708,7 +776,7 @@ class AboodControlBot:
 
     def get_active_account(self) -> dict:
         if not self.accounts:
-            return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame}
+            return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame, "has_dedicated_live": False}
         return self.accounts[self.active_account_idx]
 
     def register_captured_account(self, name: str, uid: str, demo_session: str, live_session: str) -> dict:
@@ -716,10 +784,11 @@ class AboodControlBot:
         clean_name = (name or "").strip()[:30] or f"حساب {clean_uid}"
 
         s_demo = (demo_session or live_session or "").strip()
-        s_live = (live_session or demo_session or "").strip()
+        s_live = (live_session or "").strip()
+        has_live = bool(s_live)
 
         demo_frame = make_auth_frame(s_demo, clean_uid, is_demo=True)
-        live_frame = make_auth_frame(s_live, clean_uid, is_demo=False)
+        live_frame = make_auth_frame(s_live or s_demo, clean_uid, is_demo=False)
 
         existing_idx = None
         for idx, acc in enumerate(self.accounts):
@@ -727,11 +796,16 @@ class AboodControlBot:
                 existing_idx = idx
                 break
 
+        if existing_idx is not None and not has_live and self.accounts[existing_idx].get("has_dedicated_live"):
+            live_frame = self.accounts[existing_idx]["live_auth_frame"]
+            has_live = True
+
         record = {
             "name": clean_name,
             "uid": clean_uid,
             "demo_auth_frame": demo_frame,
             "live_auth_frame": live_frame,
+            "has_dedicated_live": has_live,
             "auth_frame": demo_frame
         }
 
@@ -748,6 +822,29 @@ class AboodControlBot:
         self._sync_active_auth_frame()
         self._save_accounts_storage()
         return record
+
+    def update_active_account_single_mode(self, raw_frame: str, target_is_demo: bool) -> tuple[bool, str]:
+        parsed = parse_auth_frame(raw_frame)
+        if parsed is None or not parsed.get("session"):
+            return False, "صيغة الجلسة غير صحيحة."
+
+        acc = self.accounts[self.active_account_idx]
+        uid = str(parsed.get("uid", acc["uid"]))
+        acc["uid"] = uid
+
+        if target_is_demo:
+            acc["demo_auth_frame"] = build_auth_frame_with_mode(raw_frame, True)
+            acc["auth_frame"] = acc["demo_auth_frame"]
+        else:
+            acc["live_auth_frame"] = build_auth_frame_with_mode(raw_frame, False)
+            acc["has_dedicated_live"] = True
+
+        self.account_balance = None
+        self.limit_start_balance = None
+        self.reset_boost_state(reset_peak=True)
+        self._sync_active_auth_frame()
+        self._save_accounts_storage()
+        return True, uid
 
     def reset_boost_state(self, reset_peak: bool = False):
         self.in_boost_recovery = False
@@ -1247,17 +1344,22 @@ class AboodControlBot:
         rows = []
         for idx, acc in enumerate(self.accounts):
             prefix = "✅ " if idx == self.active_account_idx else "👤 "
+            live_tag = "Live✅" if acc.get("has_dedicated_live") else "Live⚠️"
             rows.append([{
-                "text": f"{prefix}{acc['name']} ({acc['uid']}) [Demo+Live]",
+                "text": f"{prefix}{acc['name']} ({acc['uid']}) [Demo✅|{live_tag}]",
                 "callback_data": f"select_acc_{idx}"
             }])
 
+        rows.append([
+            {"text": "🔑 تحديث جلسة الديمو", "callback_data": "set_demo_auth"},
+            {"text": "🔥 تحديث جلسة الحقيقي", "callback_data": "set_live_auth"}
+        ])
         rows.append([{
-            "text": "🤖 ربط حساب مباشر (بدون روابط أو VPN)",
+            "text": "🤖 ربط حساب مباشر عبر السيرفر",
             "callback_data": "srv_login_start"
         }])
         rows.append([
-            {"text": "⌨️ إضافة يدوية بالرمز", "callback_data": "add_account_start"},
+            {"text": "⌨️ إضافة حساب يدوي", "callback_data": "add_account_start"},
             {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
         ])
         rows.append([
@@ -1310,7 +1412,7 @@ class AboodControlBot:
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
         turnover_str = format_money(self.total_turnover)
 
-        strict_str = "🟢 مفعّل (شموع واضحة وقوية)" if self.strict_chess_enabled else "🔴 متوقف"
+        strict_str = "🟢 مفعّل (شموع واضحة اللون)" if self.strict_chess_enabled else "🔴 متوقف"
 
         if self.limits_enabled:
             if self.limit_start_balance is not None:
@@ -1566,6 +1668,20 @@ class AboodControlBot:
             await context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
+
+            # حظر الصور والوسائط والخطوط وملفات التتبع لتسريع التحميل على السيرفر وتجنب Timeout
+            async def fast_route_handler(route):
+                req_type = route.request.resource_type
+                req_url = route.request.url.lower()
+                if req_type in ("image", "media", "font"):
+                    await route.abort()
+                elif any(x in req_url for x in ("google-analytics", "googletagmanager", "facebook", "doubleclick", "yandex", "hotjar")):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await context.route("**/*", fast_route_handler)
+
             page = await context.new_page()
             self.srv_login_page = page
 
@@ -1586,8 +1702,42 @@ class AboodControlBot:
             attach_ws_listener(page)
             context.on("page", attach_ws_listener)
 
-            await page.goto("https://pocketoption.com/en/login/", wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1500)
+            login_urls = [
+                "https://pocketoption.com/en/login/",
+                "https://po.trade/en/login/",
+                "https://pocketoption.com/login/"
+            ]
+            loaded_ok = False
+            last_nav_err = None
+            for target_url in login_urls:
+                try:
+                    await page.goto(target_url, wait_until="commit", timeout=25000)
+                    await page.wait_for_selector(
+                        'input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")',
+                        timeout=20000
+                    )
+                    loaded_ok = True
+                    break
+                except Exception as nav_e:
+                    last_nav_err = nav_e
+                    continue
+
+            if not loaded_ok:
+                try:
+                    shot = await page.screenshot(type="png")
+                    await self.send_admin_photo(
+                        shot,
+                        f"⚠️ <b>تعذر تحميل نموذج الدخول من سيرفر Render حاليًا:</b>\n"
+                        f"<code>{str(last_nav_err).splitlines()[0][:140]}</code>\n\n"
+                        f"💡 يمكنك استخدام أزرار <b>🔑 تحديث جلسة الديمو</b> و <b>🔥 تحديث جلسة الحقيقي</b> لإدخالهما مباشرةً في ثوانٍ.",
+                        self.build_accounts_keyboard()
+                    )
+                except Exception:
+                    await self.send_admin(
+                        "⚠️ تعذر فتح صفحة تسجيل الدخول من سيرفر Render حاليًا. يمكنك إدخال رمز الديمو أو الحقيقي يدويًا من أزرار إدارة الحسابات.",
+                        self.build_accounts_keyboard()
+                    )
+                return
 
             # ==================================================
             # المسار أ: تسجيل الدخول عبر Google (Google Automation)
@@ -1690,7 +1840,7 @@ class AboodControlBot:
                 for _ in range(18):
                     if self.srv_login_cancel or captured_ws["session"]:
                         break
-                    if "pocketoption.com" in page.url and "/login" not in page.url:
+                    if ("pocketoption.com" in page.url or "po.trade" in page.url) and "/login" not in page.url:
                         break
 
                     cur_p = active_p if not active_p.is_closed() else page
@@ -1788,11 +1938,10 @@ class AboodControlBot:
             await page.wait_for_timeout(2000)
             html_content = await page.content()
             demo_sess, uid_val = extract_session_and_uid_from_text(html_content)
-            live_sess = demo_sess
+            live_sess = ""
 
             if captured_ws["session"]:
                 demo_sess = demo_sess or captured_ws["session"]
-                live_sess = live_sess or captured_ws["session"]
             if captured_ws["uid"]:
                 uid_val = uid_val or captured_ws["uid"]
 
@@ -1846,20 +1995,20 @@ class AboodControlBot:
                 acc_name,
                 uid_val or "Unknown",
                 demo_sess or live_sess,
-                live_sess or demo_sess
+                live_sess
             )
             self.full_reset_to_scanning("ربط حساب جديد عبر متصفح السيرفر")
             log("SRV_AUTH", f"🤖 تم ربط الحساب بنجاح عبر متصفح السيرفر: {acc['name']} (UID: {acc['uid']})")
 
+            live_note = "جاهز ومتصل ✅" if acc.get("has_dedicated_live") else "يُرجى إضافة جلسة الحقيقي من إدارة الحسابات ⚠️"
             await self.send_admin(
                 f"🎉 <b>تم ربط حسابك بالبوت بنجاح!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>اسم الحساب:</b> {acc['name']}\n"
                 f"🆔 <b>رقم الحساب (UID):</b> <code>{acc['uid']}</code>\n"
                 f"🧪 <b>الحساب التجريبي (Demo):</b> جاهز ومتصل ✅\n"
-                f"💵 <b>الحساب الحقيقي (Live):</b> جاهز ومتصل ✅\n"
-                f"🔒 <b>الأمان:</b> تم إغلاق المتصفح ومسح بيانات الدخول من الذاكرة.\n\n"
-                f"يمكنك الآن التبديل بين <b>التجريبي</b> و<b>الحقيقي</b> بضغطة زر:",
+                f"💵 <b>الحساب الحقيقي (Live):</b> {live_note}\n"
+                f"🔒 <b>الأمان:</b> تم إغلاق المتصفح ومسح بيانات الدخول من الذاكرة.",
                 self.build_main_keyboard()
             )
 
@@ -2199,6 +2348,26 @@ class AboodControlBot:
                         elif data == "toggle_account_mode":
                             if self.is_demo_mode:
                                 acc = self.get_active_account()
+                                if not acc.get("has_dedicated_live"):
+                                    await self.tg_api("editMessageText", {
+                                        "chat_id": ADMIN_CHAT_ID,
+                                        "message_id": msg_id,
+                                        "text": (
+                                            f"⚠️ <b>تنبيه: الحساب الحقيقي غير مضبوط بعد!</b>\n"
+                                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                                            f"👤 <b>الحساب:</b> {acc['name']} (<code>{acc['uid']}</code>)\n\n"
+                                            f"لأن جلسة الحساب الحقيقي منفصلة عن الديمو، يرجى أولاً إضافة متغير <code>PO_LIVE_AUTH_FRAME</code> في Render أو الضغط على <b>🔥 تحديث جلسة الحقيقي</b> وإرسال رمز جلسة الحقيقي (<code>isDemo:0</code>)."
+                                        ),
+                                        "parse_mode": "HTML",
+                                        "reply_markup": {
+                                            "inline_keyboard": [
+                                                [{"text": "🔥 تحديث جلسة الحقيقي الآن", "callback_data": "set_live_auth"}],
+                                                [{"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}]
+                                            ]
+                                        }
+                                    })
+                                    continue
+
                                 await self.tg_api("editMessageText", {
                                     "chat_id": ADMIN_CHAT_ID,
                                     "message_id": msg_id,
@@ -2242,19 +2411,37 @@ class AboodControlBot:
                                 await self.ws.close()
                         elif data == "menu_accounts":
                             acc = self.get_active_account()
+                            live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
                                 "message_id": msg_id,
                                 "text": (
                                     f"👤 <b>إدارة حسابات Pocket Option</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
-                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n\n"
-                                    f"اختر حسابًا للتبديل إليه فورًا أو اربط حسابًا جديدًا مباشرة من هنا:"
+                                    f"🔹 <b>الحساب النشط:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                    f"🧪 <b>جلسة الديمو:</b> مضبوطة ✅\n"
+                                    f"💵 <b>جلسة الحقيقي:</b> {live_st}\n"
+                                    f"🔹 <b>الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>"
                                 ),
                                 "parse_mode": "HTML",
                                 "reply_markup": self.build_accounts_keyboard()
                             })
+                            continue
+                        elif data == "set_demo_auth":
+                            self.awaiting_input = "SET_DEMO_AUTH"
+                            acc = self.get_active_account()
+                            await self.send_admin(
+                                f'🧪 أرسل الآن كود جلسة <b>الديمو (Demo)</b> للحساب <b>{acc["name"]}</b>:\n'
+                                f'<code>42["auth",{"session":"...","isDemo":1,...}]</code>'
+                            )
+                            continue
+                        elif data == "set_live_auth":
+                            self.awaiting_input = "SET_LIVE_AUTH"
+                            acc = self.get_active_account()
+                            await self.send_admin(
+                                f'🔥 أرسل الآن كود جلسة <b>الحقيقي (Live)</b> للحساب <b>{acc["name"]}</b>:\n'
+                                f'<code>42["auth",{"session":"...","isDemo":0,...}]</code>'
+                            )
                             continue
                         elif data.startswith("select_acc_"):
                             try:
@@ -2276,9 +2463,25 @@ class AboodControlBot:
                         elif data == "add_account_start":
                             self.awaiting_input = "ADD_ACC_NAME"
                             await self.send_admin(
-                                "👤 <b>إضافة حساب يدويًا — الخطوة 1 من 2:</b>\n"
+                                "👤 <b>إضافة حساب يدويًا — الخطوة 1 من 3:</b>\n"
                                 "أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>):"
                             )
+                            continue
+                        elif data == "add_acc_skip_live":
+                            parsed = parse_auth_frame(self.temp_new_acc_demo_frame)
+                            if parsed is not None:
+                                uid = str(parsed.get("uid", "Unknown"))
+                                sess = str(parsed.get("session", ""))
+                                new_acc = self.register_captured_account(self.temp_new_acc_name, uid, sess, "")
+                                self.awaiting_input = None
+                                self.full_reset_to_scanning("إضافة حساب جديد (ديمو)")
+                                await self.send_admin(
+                                    f"✅ <b>تم حفظ الحساب (Demo) بنجاح!</b>\n"
+                                    f"👤 <b>الاسم:</b> {new_acc['name']} | 🆔 <code>{uid}</code>",
+                                    self.build_main_keyboard()
+                                )
+                                if self.ws:
+                                    await self.ws.close()
                             continue
                         elif data == "menu_delete_account":
                             await self.tg_api("editMessageText", {
@@ -2464,7 +2667,81 @@ class AboodControlBot:
                                 asyncio.create_task(self.tg_api("deleteMessage", {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id_user}, req_timeout=10.0, retries=1))
                             continue
 
-                        if self.awaiting_input == "PROFIT_LIMIT":
+                        if self.awaiting_input == "SET_DEMO_AUTH":
+                            ok, uid = self.update_active_account_single_mode(text, target_is_demo=True)
+                            if ok:
+                                self.awaiting_input = None
+                                self.full_reset_to_scanning("تحديث جلسة الديمو")
+                                await self.send_admin(
+                                    f"✅ <b>تم تحديث جلسة الديمو (Demo) بنجاح!</b> (UID: <code>{uid}</code>)",
+                                    self.build_main_keyboard()
+                                )
+                                if self.ws and self.is_demo_mode:
+                                    await self.ws.close()
+                            else:
+                                await self.send_admin('⚠️ صيغة غير صحيحة. أرسل كود الجلسة الذي يبدأ بـ <code>42["auth",</code>:')
+
+                        elif self.awaiting_input == "SET_LIVE_AUTH":
+                            ok, uid = self.update_active_account_single_mode(text, target_is_demo=False)
+                            if ok:
+                                self.awaiting_input = None
+                                self.full_reset_to_scanning("تحديث جلسة الحقيقي")
+                                await self.send_admin(
+                                    f"🔥 <b>تم تحديث جلسة الحساب الحقيقي (Live) بنجاح!</b> (UID: <code>{uid}</code>)\n"
+                                    f"يمكنك الآن التبديل إلى الحساب الحقيقي من القائمة الرئيسية.",
+                                    self.build_main_keyboard()
+                                )
+                                if self.ws and not self.is_demo_mode:
+                                    await self.ws.close()
+                            else:
+                                await self.send_admin('⚠️ صيغة غير صحيحة. أرسل كود الجلسة الذي يبدأ بـ <code>42["auth",</code>:')
+
+                        elif self.awaiting_input == "ADD_ACC_NAME":
+                            self.temp_new_acc_name = text[:30]
+                            self.awaiting_input = "ADD_ACC_DEMO"
+                            await self.send_admin(
+                                f"🧪 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 2 من 3:</b>\n"
+                                f'أرسل الآن كود جلسة <b>الديمو (Demo)</b> (<code>42["auth",...]</code>):'
+                            )
+
+                        elif self.awaiting_input == "ADD_ACC_DEMO":
+                            parsed = parse_auth_frame(text)
+                            if parsed is not None and parsed.get("session"):
+                                self.temp_new_acc_demo_frame = text.strip()
+                                self.awaiting_input = "ADD_ACC_LIVE"
+                                await self.send_admin(
+                                    f"🔥 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 3 من 3:</b>\n"
+                                    f'أرسل الآن كود جلسة <b>الحقيقي (Live)</b> (<code>42["auth",...]</code>) أو اضغط تخطي:',
+                                    {
+                                        "inline_keyboard": [
+                                            [{"text": "⏭ تخطي الحقيقي الآن (حفظ الديمو فقط)", "callback_data": "add_acc_skip_live"}]
+                                        ]
+                                    }
+                                )
+                            else:
+                                await self.send_admin('⚠️ صيغة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
+
+                        elif self.awaiting_input == "ADD_ACC_LIVE":
+                            parsed_live = parse_auth_frame(text)
+                            parsed_demo = parse_auth_frame(self.temp_new_acc_demo_frame) or {}
+                            if parsed_live is not None and parsed_live.get("session"):
+                                uid = str(parsed_live.get("uid") or parsed_demo.get("uid") or "Unknown")
+                                demo_s = str(parsed_demo.get("session", ""))
+                                live_s = str(parsed_live.get("session", ""))
+                                new_acc = self.register_captured_account(self.temp_new_acc_name, uid, demo_s, live_s)
+                                self.awaiting_input = None
+                                self.full_reset_to_scanning("إضافة حساب جديد (Demo+Live)")
+                                await self.send_admin(
+                                    f"✅ <b>تم حفظ وتفعيل الحساب بالكامل (Demo + Live)!</b>\n"
+                                    f"👤 <b>الاسم:</b> {new_acc['name']} | 🆔 <code>{uid}</code>",
+                                    self.build_main_keyboard()
+                                )
+                                if self.ws:
+                                    await self.ws.close()
+                            else:
+                                await self.send_admin('⚠️ صيغة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
+
+                        elif self.awaiting_input == "PROFIT_LIMIT":
                             try:
                                 val = float(text.replace("$", ""))
                                 if val >= 0:
@@ -2595,33 +2872,6 @@ class AboodControlBot:
                                     )
                             except ValueError:
                                 await self.send_admin(f"⚠️ أرسل رقمًا صحيحًا بين 1 و {self.max_locked_pairs}:")
-
-                        elif self.awaiting_input == "ADD_ACC_NAME":
-                            self.temp_new_acc_name = text[:30]
-                            self.awaiting_input = "ADD_ACC_AUTH"
-                            await self.send_admin(
-                                f"🔑 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 2 من 2:</b>\n"
-                                f'أرسل الآن رمز الربط (<code>42["auth",...]</code>) وسيتم حفظ الحساب وتفعيله فورًا:'
-                            )
-
-                        elif self.awaiting_input == "ADD_ACC_AUTH":
-                            parsed = parse_auth_frame(text)
-                            if parsed is not None:
-                                uid = str(parsed.get("uid", "Unknown"))
-                                sess = str(parsed.get("session", ""))
-                                new_acc = self.register_captured_account(self.temp_new_acc_name, uid, sess, sess)
-                                self.awaiting_input = None
-                                self.full_reset_to_scanning("إضافة وتفعيل حساب جديد")
-                                await self.send_admin(
-                                    f"✅ <b>تم حفظ وتفعيل الحساب بنجاح (Demo + Live)!</b>\n"
-                                    f"👤 <b>الاسم:</b> {new_acc['name']}\n"
-                                    f"🆔 <b>الآيدي (UID):</b> <code>{uid}</code>",
-                                    self.build_main_keyboard()
-                                )
-                                if self.ws:
-                                    await self.ws.close()
-                            else:
-                                await self.send_admin('⚠️ صيغة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
 
                         elif self.awaiting_input == "BASE_AMOUNT":
                             try:
