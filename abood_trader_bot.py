@@ -1,16 +1,20 @@
 import asyncio
-import base64
 import inspect
 import json
 import os
+import re
 import secrets
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 import websockets
+
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    async_playwright = None
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -21,9 +25,6 @@ if sys.stdout.encoding != "utf-8":
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
-
-# رابط الاستضافة العام على Render (يُقرأ تلقائيًا من Render أو من الرابط الافتراضي)
-PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://abood-trader.onrender.com").rstrip("/")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
 DEFAULT_LEAD_SECONDS = 0.1
@@ -148,6 +149,18 @@ def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
     return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
 
 
+def extract_session_and_uid_from_text(html_text: str) -> tuple[str, str]:
+    if not html_text:
+        return "", ""
+    sess_match = re.search(r'["\']?session["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]{16,64})["\']', html_text)
+    uid_match = re.search(r'["\']?uid["\']?\s*[:=]\s*["\']?(\d{5,15})["\']?', html_text)
+    if not uid_match:
+        uid_match = re.search(r'data-uid=["\'](\d{5,15})["\']', html_text)
+    sess = sess_match.group(1) if sess_match else ""
+    uid = uid_match.group(1) if uid_match else ""
+    return sess, uid
+
+
 # ==========================================
 # دوال حساب المؤشرات الفنية (بدون مكتبات خارجية)
 # ==========================================
@@ -234,9 +247,9 @@ class AboodControlBot:
         # نظام الحدود (حد الربح وحد الخسارة مع زر تفعيل/إيقاف مشترك)
         # ==========================================
         self.limits_enabled = False
-        self.profit_limit = 50.0             # حد الربح بالدولار (مثلاً +50$)
-        self.loss_limit = 50.0               # حد الخسارة بالدولار (مثلاً -50$)
-        self.limit_start_balance = None      # رصيد بداية الجلسة لاحتساب الربح/الخسارة بدقة
+        self.profit_limit = 50.0
+        self.loss_limit = 50.0
+        self.limit_start_balance = None
 
         # ==========================================
         # نظام المؤشرات والفلاتر (بإعدادات متوسطة ومتوازنة)
@@ -255,17 +268,23 @@ class AboodControlBot:
         self.ind_atr_enabled = False
         self.last_ind_skip_log = {}
 
-        # إدارة الحسابات ووضع التداول (تجريبي / حقيقي) + رمز الأمان لبوابة الهاتف
+        # إدارة الحسابات ووضع التداول (تجريبي / حقيقي)
         self.accounts = []
         self.active_account_idx = 0
         self.is_demo_mode = True
         self.auth_frame = DEFAULT_AUTH_FRAME
-        self.web_connect_token = ""
         self.temp_new_acc_name = ""
         self._load_accounts_storage()
 
+        # متغيرات جلسة الربط المباشر عبر متصفح السيرفر (Playwright)
+        self.srv_login_task = None
+        self.srv_login_page = None
+        self.srv_login_input_event = asyncio.Event()
+        self.srv_login_last_input = ""
+        self.srv_login_cancel = False
+
         # ==========================================
-        # نظام التعزيز الذكي (يُطبَّق على الصفقات الجديدة فقط دون المساس بالصفقات الجارية)
+        # نظام التعزيز الذكي (يُطبَّق على الصفقات الجديدة فقط دون المساس بالصفقات الجارية)
         # ==========================================
         self.boost_enabled = False
         self.boost_mode = "CAPITAL"
@@ -277,7 +296,7 @@ class AboodControlBot:
         self.peak_balance = None
         self.current_cycle_spent = 0.0
 
-        # 2) إعدادات وضع مواصلة النموذج بعد الربح من أول دخول
+        # وضع مواصلة النموذج بعد الربح من أول دخول
         self.continuation_enabled = False
 
         # نطاق المسح
@@ -370,10 +389,6 @@ class AboodControlBot:
             self.limit_start_balance = None
 
     def check_and_enforce_limits(self, current_bal: float) -> bool:
-        """
-        يتحقق من حد الربح وحد الخسارة.
-        يرجع True إذا تم الوصول لأحد الحدين وتم إيقاف البوت.
-        """
         if not self.is_running or not self.limits_enabled:
             return False
 
@@ -384,7 +399,6 @@ class AboodControlBot:
         start_b = self.limit_start_balance
         diff = float(current_bal) - start_b
 
-        # 1) فحص حد الربح
         if self.profit_limit > 0 and diff >= (self.profit_limit - 0.001):
             self.is_running = False
             self.full_reset_to_scanning("الوصول إلى حد الربح")
@@ -400,7 +414,6 @@ class AboodControlBot:
             ))
             return True
 
-        # 2) فحص حد الخسارة
         if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 0.001):
             self.is_running = False
             self.full_reset_to_scanning("الوصول إلى حد الخسارة")
@@ -549,13 +562,9 @@ class AboodControlBot:
                     self.accounts = [self._normalize_account_record(a) for a in data["accounts"]]
                     self.active_account_idx = min(int(data.get("active_idx", 0)), len(self.accounts) - 1)
                     self.is_demo_mode = bool(data.get("is_demo_mode", True))
-                    self.web_connect_token = str(data.get("web_token", "")).strip()
                     loaded = True
             except Exception as e:
                 log("ACC_WARN", f"تعذر قراءة ملف الحسابات: {e}")
-
-        if not self.web_connect_token:
-            self.web_connect_token = secrets.token_urlsafe(16)
 
         if not loaded or not self.accounts:
             parsed = parse_auth_frame(DEFAULT_AUTH_FRAME) or {}
@@ -577,7 +586,6 @@ class AboodControlBot:
                 json.dump({
                     "active_idx": self.active_account_idx,
                     "is_demo_mode": self.is_demo_mode,
-                    "web_token": self.web_connect_token,
                     "accounts": self.accounts
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -597,12 +605,6 @@ class AboodControlBot:
         if not self.accounts:
             return {"name": "غير محدد", "uid": "000000", "auth_frame": self.auth_frame}
         return self.accounts[self.active_account_idx]
-
-    def get_mobile_connect_url(self, acc_name: str = "") -> str:
-        url = f"{PUBLIC_BASE_URL}/connect?token={quote(self.web_connect_token)}"
-        if acc_name:
-            url += f"&name={quote(acc_name)}"
-        return url
 
     def register_captured_account(self, name: str, uid: str, demo_session: str, live_session: str) -> dict:
         clean_uid = str(uid).strip() or "Unknown"
@@ -922,7 +924,7 @@ class AboodControlBot:
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
                 [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
                 [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
-                [{"text": f"🎯 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
+                [{"text": f"🔭 مستوى المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [
                     {"text": dual_label, "callback_data": "set_dual_pairs"},
                     {"text": trades_label, "callback_data": "set_concurrent_trades"}
@@ -1141,19 +1143,12 @@ class AboodControlBot:
             }])
 
         rows.append([{
-            "text": "📱 فتح بوابة الربط من الهاتف",
-            "url": self.get_mobile_connect_url()
-        }])
-        rows.append([{
-            "text": "📲 إرسال رابط الربط للنسخ (للمتصفح الخارجي)",
-            "callback_data": "send_mobile_link_copy"
+            "text": "🤖 ربط حساب مباشر (بدون روابط أو VPN)",
+            "callback_data": "srv_login_start"
         }])
         rows.append([
-            {"text": "⌨️ إضافة يدوية بالجلسة", "callback_data": "add_account_start"},
+            {"text": "⌨️ إضافة يدوية بالرمز", "callback_data": "add_account_start"},
             {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
-        ])
-        rows.append([
-            {"text": "🔑 تحديث جلسة الحساب الحالي", "callback_data": "set_auth"}
         ])
         rows.append([
             {"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}
@@ -1306,6 +1301,23 @@ class AboodControlBot:
             payload["reply_markup"] = reply_markup
         await self.tg_api("sendMessage", payload, req_timeout=15.0, retries=3)
 
+    async def send_admin_photo(self, photo_bytes: bytes, caption: str, reply_markup: dict = None):
+        if not self.http_session:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(ADMIN_CHAT_ID))
+        form.add_field("caption", caption)
+        form.add_field("parse_mode", "HTML")
+        if reply_markup:
+            form.add_field("reply_markup", json.dumps(reply_markup))
+        form.add_field("photo", photo_bytes, filename="screen.png", content_type="image/png")
+        try:
+            async with self.http_session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=25.0)) as resp:
+                await resp.json()
+        except Exception as e:
+            log("TG_PHOTO_WARN", f"تعذر إرسال لقطة الشاشة: {e}")
+
     async def send_channel(self, text: str, reply_to_message_id: int = None) -> int | None:
         if not CHANNEL_ID or "ضع_" in str(CHANNEL_ID):
             log("WARN", "لم يتم ضبط CHANNEL_ID بعد — تعذّر الإرسال للقناة.")
@@ -1360,6 +1372,406 @@ class AboodControlBot:
                     await self.send_admin("📊 تم نشر التقرير اليومي تلقائيًا في القناة وتصفير عداد اليوم الجديد ✅")
                 self.reset_daily_stats()
 
+    # ==========================================
+    # محرك الربط المباشر عبر متصفح السيرفر (Email/Password + Google Sign-In)
+    # ==========================================
+    def _cancel_server_login(self):
+        self.srv_login_cancel = True
+        self.srv_login_input_event.set()
+        if self.srv_login_task and not self.srv_login_task.done():
+            self.srv_login_task.cancel()
+        self.srv_login_task = None
+        self.srv_login_page = None
+        if str(self.awaiting_input or "").startswith("SRV_"):
+            self.awaiting_input = None
+
+    async def _wait_user_step_input(self, state_name: str, timeout_sec: int = 180) -> str | None:
+        self.srv_login_input_event.clear()
+        self.srv_login_last_input = ""
+        self.awaiting_input = state_name
+        try:
+            await asyncio.wait_for(self.srv_login_input_event.wait(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            if self.awaiting_input == state_name:
+                self.awaiting_input = None
+        if self.srv_login_cancel:
+            return None
+        return self.srv_login_last_input
+
+    async def run_server_browser_login(self, acc_name: str, login_method: str):
+        if async_playwright is None:
+            await self.send_admin(
+                "⚠️ مكتبة <code>playwright</code> غير مثبتة على السيرفر بعد.\n"
+                "أضف <code>playwright==1.49.1</code> في <code>requirements.txt</code> و <code>playwright install chromium</code> في أمر البناء على Render."
+            )
+            return
+
+        self.srv_login_cancel = False
+        cancel_kb = {"inline_keyboard": [[{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]]}
+
+        pw = None
+        browser = None
+        try:
+            await self.send_admin(
+                f"🌐 <b>جاري تشغيل المتصفح الآمن على السيرفر لحساب ({acc_name})...</b>\n"
+                f"⏳ يُرجى الانتظار بضع ثوانٍ.",
+                cancel_kb
+            )
+
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-zygote",
+                    "--single-process",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,800",
+                ]
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="en-US"
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = await context.new_page()
+            self.srv_login_page = page
+
+            captured_ws = {"session": "", "uid": ""}
+
+            def attach_ws_listener(target_page):
+                def on_ws(ws):
+                    def on_frame(payload):
+                        if isinstance(payload, str) and payload.startswith('42["auth",'):
+                            parsed = parse_auth_frame(payload)
+                            if parsed and parsed.get("session"):
+                                captured_ws["session"] = str(parsed["session"])
+                                if parsed.get("uid"):
+                                    captured_ws["uid"] = str(parsed["uid"])
+                    ws.on("framesent", on_frame)
+                target_page.on("websocket", on_ws)
+
+            attach_ws_listener(page)
+            context.on("page", attach_ws_listener)
+
+            await page.goto("https://pocketoption.com/en/login/", wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(1500)
+
+            # ==================================================
+            # المسار أ: تسجيل الدخول عبر Google (Google Automation)
+            # ==================================================
+            if login_method == "GOOGLE":
+                google_selectors = [
+                    'a[href*="google"]',
+                    'button:has-text("Google")',
+                    'a:has-text("Google")',
+                    '.social-btn--google',
+                    '[data-provider="google"]'
+                ]
+                clicked_google = False
+                popup_page = None
+
+                for sel in google_selectors:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0:
+                        try:
+                            async with context.expect_page(timeout=4000) as popup_info:
+                                await loc.click(timeout=5000)
+                            popup_page = await popup_info.value
+                        except Exception:
+                            try:
+                                await loc.click(timeout=5000)
+                            except Exception:
+                                continue
+                        clicked_google = True
+                        break
+
+                if not clicked_google:
+                    shot = await page.screenshot(type="png")
+                    await self.send_admin_photo(
+                        shot,
+                        "⚠️ لم يظهر زر Google مباشرة في الصفحة. تأكد من الصفحة أو أعد المحاولة.",
+                        cancel_kb
+                    )
+                    return
+
+                active_p = popup_page if popup_page else page
+                await active_p.wait_for_load_state("domcontentloaded", timeout=25000)
+                await active_p.wait_for_timeout(1500)
+
+                shot = await active_p.screenshot(type="png")
+                await self.send_admin_photo(
+                    shot,
+                    "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\n"
+                    "أرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
+                    cancel_kb
+                )
+
+                g_email = await self._wait_user_step_input("SRV_GOOGLE_EMAIL", timeout_sec=180)
+                if not g_email:
+                    return
+
+                email_inp = active_p.locator('input[type="email"]').first
+                await email_inp.wait_for(state="visible", timeout=15000)
+                await email_inp.fill(g_email.strip())
+                await active_p.keyboard.press("Enter")
+                await active_p.wait_for_timeout(3000)
+
+                pass_inp = active_p.locator('input[type="password"]').first
+                if await pass_inp.count() == 0:
+                    shot = await active_p.screenshot(type="png")
+                    await self.send_admin_photo(
+                        shot,
+                        "⚠️ <b>تنبيه من Google:</b>\n"
+                        "لم يظهر حقل كلمة المرور بعد (ربما يوجد تحقق أمني). أرسل النص المطلوب أو اضغط تحديث اللقطة:",
+                        {
+                            "inline_keyboard": [
+                                [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
+                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
+                            ]
+                        }
+                    )
+                    retry_txt = await self._wait_user_step_input("SRV_GOOGLE_2FA", timeout_sec=180)
+                    if not retry_txt:
+                        return
+                    any_inp = active_p.locator('input:visible').first
+                    if await any_inp.count() > 0:
+                        await any_inp.fill(retry_txt.strip())
+                        await active_p.keyboard.press("Enter")
+                        await active_p.wait_for_timeout(3000)
+
+                pass_inp = active_p.locator('input[type="password"]').first
+                if await pass_inp.count() > 0:
+                    await self.send_admin(
+                        "🔒 <b>تسجيل الدخول عبر Google — الخطوة 2:</b>\n"
+                        "أرسل الآن <b>كلمة مرور حساب Google</b> (سيتم حذف رسالتك فور استلامها للحماية):",
+                        cancel_kb
+                    )
+                    g_pass = await self._wait_user_step_input("SRV_GOOGLE_PASS", timeout_sec=180)
+                    if not g_pass:
+                        return
+
+                    await pass_inp.fill(g_pass)
+                    await active_p.keyboard.press("Enter")
+                    await active_p.wait_for_timeout(3500)
+
+                for _ in range(18):
+                    if self.srv_login_cancel or captured_ws["session"]:
+                        break
+                    if "pocketoption.com" in page.url and "/login" not in page.url:
+                        break
+
+                    cur_p = active_p if not active_p.is_closed() else page
+                    cur_url = cur_p.url
+                    if "accounts.google.com" in cur_url and ("challenge" in cur_url or "signin" in cur_url):
+                        shot = await cur_p.screenshot(type="png")
+                        code_inp = cur_p.locator('input[type="tel"], input[name="totpPin"], input[id*="pin"]').first
+                        if await code_inp.count() > 0:
+                            await self.send_admin_photo(
+                                shot,
+                                "📲 <b>التحقق بخطوتين من Google:</b>\n"
+                                "أرسل الآن <b>رمز التحقق</b> الظاهر في رسالتك أو تطبيق المصادقة:",
+                                cancel_kb
+                            )
+                            otp_code = await self._wait_user_step_input("SRV_GOOGLE_2FA", timeout_sec=180)
+                            if not otp_code:
+                                return
+                            await code_inp.fill(otp_code.strip())
+                            await cur_p.keyboard.press("Enter")
+                            await cur_p.wait_for_timeout(3000)
+                        else:
+                            await self.send_admin_photo(
+                                shot,
+                                "📱 <b>تأكيد الدخول من هاتفك:</b>\n"
+                                "إذا ظهرت لك رسالة تأكيد من Google على هاتفك، اضغط <b>نعم (Yes)</b> واختر الرقم المطابق الظاهر في الصورة أعلاه.\n"
+                                "⏳ البوت ينتظر إتمام التأكيد تلقائيًا...",
+                                {
+                                    "inline_keyboard": [
+                                        [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
+                                        [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
+                                    ]
+                                }
+                            )
+                            await cur_p.wait_for_timeout(4500)
+                    else:
+                        await page.wait_for_timeout(1500)
+
+            # ==================================================
+            # المسار ب: تسجيل الدخول بالبريد الإلكتروني وكلمة المرور
+            # ==================================================
+            else:
+                await self.send_admin(
+                    "📧 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 1:</b>\n"
+                    "أرسل الآن <b>البريد الإلكتروني</b> المسجل في Pocket Option:",
+                    cancel_kb
+                )
+                po_email = await self._wait_user_step_input("SRV_PO_EMAIL", timeout_sec=180)
+                if not po_email:
+                    return
+
+                await self.send_admin(
+                    "🔒 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 2:</b>\n"
+                    "أرسل الآن <b>كلمة المرور</b> (سيتم حذف رسالتك فور استلامها للحماية):",
+                    cancel_kb
+                )
+                po_pass = await self._wait_user_step_input("SRV_PO_PASS", timeout_sec=180)
+                if not po_pass:
+                    return
+
+                email_field = page.locator('input[name="email"], input[type="email"]').first
+                pass_field = page.locator('input[name="password"], input[type="password"]').first
+                await email_field.wait_for(state="visible", timeout=15000)
+                await email_field.fill(po_email.strip())
+                await pass_field.fill(po_pass)
+
+                submit_btn = page.locator('button[type="submit"], input[type="submit"]').first
+                if await submit_btn.count() > 0:
+                    await submit_btn.click()
+                else:
+                    await page.keyboard.press("Enter")
+
+                await page.wait_for_timeout(3500)
+
+                if "/login" in page.url and not captured_ws["session"]:
+                    shot = await page.screenshot(type="png")
+                    await self.send_admin_photo(
+                        shot,
+                        "⏳ <b>جاري التحقق من إتمام الدخول...</b>\n"
+                        "إذا ظهر رمز تحقق (2FA) أرسله هنا الآن، أو انتظر لحظات لإتمام الاتصال:",
+                        {
+                            "inline_keyboard": [
+                                [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
+                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
+                            ]
+                        }
+                    )
+                    for _ in range(12):
+                        if self.srv_login_cancel or captured_ws["session"] or "/login" not in page.url:
+                            break
+                        await page.wait_for_timeout(1500)
+
+            # ==================================================
+            # مرحلة الربط التلقائي للديمو والحقيقي داخل المتصفح
+            # ==================================================
+            if self.srv_login_cancel:
+                return
+
+            await page.wait_for_timeout(2000)
+            html_content = await page.content()
+            demo_sess, uid_val = extract_session_and_uid_from_text(html_content)
+            live_sess = demo_sess
+
+            if captured_ws["session"]:
+                demo_sess = demo_sess or captured_ws["session"]
+                live_sess = live_sess or captured_ws["session"]
+            if captured_ws["uid"]:
+                uid_val = uid_val or captured_ws["uid"]
+
+            try:
+                res_both = await page.evaluate("""async () => {
+                    let out = {demo: '', live: '', uid: ''};
+                    const grab = (t) => {
+                        let u = (t.match(/["']?uid["']?\\s*[:=]\\s*["']?(\\d{5,15})["']?/i) || [])[1] || '';
+                        let s = (t.match(/["']?session["']?\\s*[:=]\\s*["']([a-zA-Z0-9_-]{16,64})["']/i) || [])[1] || '';
+                        return {u, s};
+                    };
+                    try {
+                        let r1 = await fetch('/en/cabinet/demo-quick-high-low/', {credentials: 'include'});
+                        if (r1.ok) {
+                            let g1 = grab(await r1.text());
+                            if (g1.s) out.demo = g1.s;
+                            if (g1.u) out.uid = g1.u;
+                        }
+                    } catch(e) {}
+                    try {
+                        let r2 = await fetch('/en/cabinet/quick-high-low/', {credentials: 'include'});
+                        if (r2.ok) {
+                            let g2 = grab(await r2.text());
+                            if (g2.s) out.live = g2.s;
+                            if (g2.u && !out.uid) out.uid = g2.u;
+                        }
+                    } catch(e) {}
+                    return out;
+                }""")
+                if isinstance(res_both, dict):
+                    if res_both.get("demo"):
+                        demo_sess = res_both["demo"]
+                    if res_both.get("live"):
+                        live_sess = res_both["live"]
+                    if res_both.get("uid") and not uid_val:
+                        uid_val = res_both["uid"]
+            except Exception:
+                pass
+
+            if not demo_sess and not live_sess:
+                shot = await page.screenshot(type="png")
+                await self.send_admin_photo(
+                    shot,
+                    "⚠️ <b>تعذر إتمام الربط التلقائي:</b>\n"
+                    "تأكد من صحة بيانات الدخول أو رمز التحقق ثم أعد المحاولة.",
+                    self.build_accounts_keyboard()
+                )
+                return
+
+            acc = self.register_captured_account(
+                acc_name,
+                uid_val or "Unknown",
+                demo_sess or live_sess,
+                live_sess or demo_sess
+            )
+            self.full_reset_to_scanning("ربط حساب جديد عبر متصفح السيرفر")
+            log("SRV_AUTH", f"🤖 تم ربط الحساب بنجاح عبر متصفح السيرفر: {acc['name']} (UID: {acc['uid']})")
+
+            await self.send_admin(
+                f"🎉 <b>تم ربط حسابك بالبوت بنجاح!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>اسم الحساب:</b> {acc['name']}\n"
+                f"🆔 <b>رقم الحساب (UID):</b> <code>{acc['uid']}</code>\n"
+                f"🧪 <b>الحساب التجريبي (Demo):</b> جاهز ومتصل ✅\n"
+                f"💵 <b>الحساب الحقيقي (Live):</b> جاهز ومتصل ✅\n"
+                f"🔒 <b>الأمان:</b> تم إغلاق المتصفح ومسح بيانات الدخول من الذاكرة.\n\n"
+                f"يمكنك الآن التبديل بين <b>التجريبي</b> و<b>الحقيقي</b> بضغطة زر:",
+                self.build_main_keyboard()
+            )
+
+            if self.ws:
+                await self.ws.close()
+
+        except asyncio.CancelledError:
+            log("SRV_AUTH", "تم إلغاء جلسة الربط على السيرفر.")
+        except Exception as e:
+            log("SRV_AUTH_ERR", f"خطأ أثناء الربط عبر السيرفر: {e}")
+            await self.send_admin(
+                "⚠️ حدث خطأ أثناء الاتصال بالمنصة على السيرفر. حاول مرة أخرى.",
+                self.build_accounts_keyboard()
+            )
+        finally:
+            self.srv_login_page = None
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if pw:
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
+
+    # ==========================================
+    # حلقة استقبال أوامر وأزرار تليجرام
+    # ==========================================
     async def telegram_polling_loop(self):
         offset = 0
         log("TG", "بوت الإدارة جاهز ✅ أرسل /start في الخاص لفتح لوحة التحكم.")
@@ -1400,6 +1812,72 @@ class AboodControlBot:
                             continue
 
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
+
+                        if data == "srv_login_start":
+                            self._cancel_server_login()
+                            self.awaiting_input = "SRV_ACC_NAME"
+                            await self.send_admin(
+                                "🤖 <b>ربط حساب مباشر عبر السيرفر (بدون روابط أو VPN)</b>\n"
+                                "━━━━━━━━━━━━━━━━━━━━\n"
+                                "1️⃣ أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>) أو اضغط تخطي:",
+                                {
+                                    "inline_keyboard": [
+                                        [{"text": "⏭ تخطي (اسم تلقائي)", "callback_data": "srv_login_skip_name"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            )
+                            continue
+                        elif data == "srv_login_skip_name":
+                            self.temp_new_acc_name = f"حساب {len(self.accounts) + 1}"
+                            self.awaiting_input = None
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": (
+                                    f"👤 <b>الحساب:</b> {self.temp_new_acc_name}\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:"
+                                ),
+                                "parse_mode": "HTML",
+                                "reply_markup": {
+                                    "inline_keyboard": [
+                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "srv_method_GOOGLE"}],
+                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "srv_method_EMAIL"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            })
+                            continue
+                        elif data.startswith("srv_method_"):
+                            method_choice = data.replace("srv_method_", "")
+                            self._cancel_server_login()
+                            acc_nm = self.temp_new_acc_name or f"حساب {len(self.accounts) + 1}"
+                            self.srv_login_task = asyncio.create_task(
+                                self.run_server_browser_login(acc_nm, method_choice)
+                            )
+                            continue
+                        elif data == "srv_login_shot":
+                            if self.srv_login_page and not self.srv_login_page.is_closed():
+                                try:
+                                    shot = await self.srv_login_page.screenshot(type="png")
+                                    await self.send_admin_photo(
+                                        shot,
+                                        "📸 <b>لقطة الشاشة الحالية من متصفح السيرفر:</b>",
+                                        {
+                                            "inline_keyboard": [
+                                                [{"text": "📸 تحديث اللقطة", "callback_data": "srv_login_shot"}],
+                                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
+                                            ]
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            continue
+                        elif data == "srv_login_cancel":
+                            self._cancel_server_login()
+                            await self.send_admin("❌ تم إلغاء عملية ربط الحساب وإغلاق المتصفح.", self.build_accounts_keyboard())
+                            continue
 
                         if data == "cmd_start":
                             self.is_running = True
@@ -1466,17 +1944,6 @@ class AboodControlBot:
                             self.awaiting_input = "LOSS_LIMIT"
                             await self.send_admin(
                                 "📉 أرسل الآن <b>حد الخسارة بالدولار</b> (مثال: <code>50</code>؛ أو <code>0</code> لتعطيله):"
-                            )
-                            continue
-                        elif data == "send_mobile_link_copy":
-                            link = self.get_mobile_connect_url()
-                            await self.send_admin(
-                                f"📲 <b>رابط الربط المباشر من متصفح الهاتف (Chrome / Safari):</b>\n\n"
-                                f"<code>{link}</code>\n\n"
-                                f"📌 <b>الخطوات السريعة:</b>\n"
-                                f"1️⃣ شغّل الـ <b>VPN</b> على هاتفك.\n"
-                                f"2️⃣ انسخ الرابط أعلاه وافتحه في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي.\n"
-                                f"3️⃣ انسخ كود الربط السريع من الصفحة واحفظه في مفضلة المتصفح، ثم افتح Pocket Option وسجّل الدخول واضغط على المفضلة."
                             )
                             continue
                         elif data == "menu_boost":
@@ -1658,9 +2125,8 @@ class AboodControlBot:
                                     f"👤 <b>إدارة حسابات Pocket Option</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
                                     f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
-                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n"
-                                    f"🔹 <b>ربط الهاتف:</b> شغّل الـ VPN وافتح بوابة الربط في متصفح Chrome/Safari الخارجي 📱\n\n"
-                                    f"اختر حسابًا للتبديل إليه فورًا أو أضف حسابًا جديدًا:"
+                                    f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>\n\n"
+                                    f"اختر حسابًا للتبديل إليه فورًا أو اربط حسابًا جديدًا مباشرة من هنا:"
                                 ),
                                 "parse_mode": "HTML",
                                 "reply_markup": self.build_accounts_keyboard()
@@ -1755,7 +2221,7 @@ class AboodControlBot:
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
                                 "message_id": msg_id,
-                                "text": "🎯 <b>اختر مستوى ونطاق المسح المطلوب:</b>",
+                                "text": "🔭 <b>اختر مستوى ونطاق المسح المطلوب:</b>",
                                 "parse_mode": "HTML",
                                 "reply_markup": self.build_scope_keyboard()
                             })
@@ -1792,13 +2258,6 @@ class AboodControlBot:
                             self.awaiting_input = "LEAD_TIME"
                             await self.send_admin("⏱ أرسل الآن <b>الفحص والدخول قبل الإغلاق بأجزاء الثانية</b> (مثال: <code>0.1</code>):")
                             continue
-                        elif data == "set_auth":
-                            self.awaiting_input = "AUTH"
-                            acc = self.get_active_account()
-                            await self.send_admin(
-                                f'🔑 أرسل الآن كود الجلسة الجديد (<code>42["auth",...]</code>) للحساب <b>{acc["name"]}</b>:'
-                            )
-                            continue
 
                         await self.tg_api("editMessageText", {
                             "chat_id": ADMIN_CHAT_ID,
@@ -1811,6 +2270,7 @@ class AboodControlBot:
                     elif "message" in update:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
+                        msg_id_user = msg.get("message_id")
                         if chat_id != str(ADMIN_CHAT_ID):
                             continue
 
@@ -1830,6 +2290,7 @@ class AboodControlBot:
                             continue
 
                         if text in ("/start", "/menu", "القائمة"):
+                            self._cancel_server_login()
                             self.awaiting_input = None
                             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
                             continue
@@ -1852,6 +2313,31 @@ class AboodControlBot:
                                 f"✅ تم تصفير التعزيز وإعادة المبلغ الأساسي إلى <b>${self.base_amount:g}</b>.",
                                 self.build_main_keyboard()
                             )
+                            continue
+
+                        if self.awaiting_input == "SRV_ACC_NAME":
+                            self.temp_new_acc_name = text[:30]
+                            self.awaiting_input = None
+                            await self.send_admin(
+                                f"👤 <b>الحساب:</b> {self.temp_new_acc_name}\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:",
+                                {
+                                    "inline_keyboard": [
+                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "srv_method_GOOGLE"}],
+                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "srv_method_EMAIL"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            )
+                            continue
+
+                        if self.awaiting_input in ("SRV_GOOGLE_EMAIL", "SRV_GOOGLE_PASS", "SRV_GOOGLE_2FA", "SRV_PO_EMAIL", "SRV_PO_PASS"):
+                            cur_state = self.awaiting_input
+                            self.srv_login_last_input = text
+                            self.srv_login_input_event.set()
+                            if cur_state in ("SRV_GOOGLE_PASS", "SRV_PO_PASS") and msg_id_user:
+                                asyncio.create_task(self.tg_api("deleteMessage", {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id_user}, req_timeout=10.0, retries=1))
                             continue
 
                         if self.awaiting_input == "PROFIT_LIMIT":
@@ -1983,7 +2469,7 @@ class AboodControlBot:
                             self.awaiting_input = "ADD_ACC_AUTH"
                             await self.send_admin(
                                 f"🔑 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 2 من 2:</b>\n"
-                                f'أرسل الآن إطار الجلسة الكامل (<code>42["auth",...]</code>) وسيتم استخراج الآيدي وحفظ الحساب تلقائيًا:'
+                                f'أرسل الآن رمز الربط (<code>42["auth",...]</code>) وسيتم حفظ الحساب وتفعيله فورًا:'
                             )
 
                         elif self.awaiting_input == "ADD_ACC_AUTH":
@@ -2003,7 +2489,7 @@ class AboodControlBot:
                                 if self.ws:
                                     await self.ws.close()
                             else:
-                                await self.send_admin('⚠️ صيغة الجلسة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
+                                await self.send_admin('⚠️ صيغة غير صحيحة. تأكد أنها تبدأ بـ <code>42["auth",</code> وأعد إرسالها:')
 
                         elif self.awaiting_input == "BASE_AMOUNT":
                             try:
@@ -2094,23 +2580,6 @@ class AboodControlBot:
                                     await self.send_admin("⚠️ أدخل قيمة بين -1.0 و 3.0 ثانية:")
                             except ValueError:
                                 await self.send_admin("⚠️ أرسل رقمًا عشريًا (مثال: <code>0.1</code>):")
-
-                        elif self.awaiting_input == "AUTH":
-                            parsed = parse_auth_frame(text)
-                            if parsed is not None:
-                                uid = str(parsed.get("uid", self.get_active_account()["uid"]))
-                                sess = str(parsed.get("session", ""))
-                                curr_name = self.get_active_account()["name"]
-                                self.register_captured_account(curr_name, uid, sess, sess)
-                                self.awaiting_input = None
-                                await self.send_admin(
-                                    f"✅ تم تحديث جلسة الحساب <b>{curr_name}</b> (<code>{uid}</code>) للديمو والحقيقي. جاري إعادة الاتصال...",
-                                    self.build_main_keyboard()
-                                )
-                                if self.ws:
-                                    await self.ws.close()
-                            else:
-                                await self.send_admin('⚠️ صيغة غير صحيحة. يجب أن تبدأ بـ <code>42["auth",</code>:')
 
             except Exception as e:
                 log("TG_POLL_WARN", f"إعادة تنشيط حلقة تليجرام: {type(e).__name__}")
@@ -2812,7 +3281,6 @@ class AboodControlBot:
             rank = len(self.locked_candidates) + 1
             priority_line = f"┃ 🔢 الأولوية  <b>#{rank}</b>\n" if self.max_locked_pairs > 1 else ""
 
-            # شرط البيع: أحمر -> أحمر -> أخضر -> أحمر
             if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
                 if self.indicators_enabled:
                     ind_ok, ind_reason = self.check_indicators(asset, "put", is_pre_close=False)
@@ -2849,7 +3317,6 @@ class AboodControlBot:
                     f"🎯 رصد نموذج بيع [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
                 )
 
-            # شرط الشراء: أخضر -> أخضر -> أحمر -> أخضر
             elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
                 if self.indicators_enabled:
                     ind_ok, ind_reason = self.check_indicators(asset, "call", is_pre_close=False)
@@ -2906,7 +3373,6 @@ class AboodControlBot:
                 mode_label = "الديمو" if self.is_demo_mode else "الحقيقي"
                 log("BALANCE", f"رصيد الحساب ({mode_label}) الحالي: ${format_money(new_bal)}")
 
-                # فحص حدود الربح والخسارة فور تحديث الرصيد
                 if self.check_and_enforce_limits(new_bal):
                     return
 
@@ -3070,345 +3536,23 @@ class AboodControlBot:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
-    # بوابة الويب المدمجة للهواتف (أندرويد / آيفون) + مراقبة Render 24/7
+    # خادم الويب المدمج لإبقاء الاستضافة المجانية على Render نشطة 24/7
     # ==========================================
-    def build_bookmarklet_js(self, acc_name: str = "حساب الهاتف") -> str:
-        """بناء كود الالتقاط الذكي (يفحص الصفحة + التخزين + صفحتي الديمو والحقيقي + WebSocket المباشر)"""
-        cfg_b64 = base64.b64encode(json.dumps({
-            "base": PUBLIC_BASE_URL,
-            "token": self.web_connect_token,
-            "name": (acc_name.strip() or "حساب الهاتف")
-        }).encode("utf-8")).decode("ascii")
-
-        payload_js = (
-            "(async function(){"
-            "try{"
-            f"var cfg=JSON.parse(decodeURIComponent(escape(atob('{cfg_b64}'))));"
-            "function sendAll(u,ds,ls){"
-            "if(!ds&&!ls)return false;"
-            "location.href=cfg.base+'/api/mobile_capture_redirect?token='+encodeURIComponent(cfg.token)+'&name='+encodeURIComponent(cfg.name)+'&uid='+encodeURIComponent(u||'Unknown')+'&demo_s='+encodeURIComponent(ds||ls)+'&live_s='+encodeURIComponent(ls||ds);"
-            "return true;"
-            "}"
-            "function scanText(t){"
-            "if(!t)return{};"
-            "var u=(t.match(/['\"]?uid['\"]?\\s*[:=]\\s*['\"]?(\\d{5,15})['\"]?/i)||t.match(/data-uid=['\"](\\d{5,15})['\"]/i)||[])[1]||'';"
-            "var s=(t.match(/['\"]?session['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_-]{16,64})['\"]/i)||[])[1]||'';"
-            "return{u:u,s:s};"
-            "}"
-            "var r=scanText(document.documentElement.innerHTML);"
-            "var u=r.u,ds=r.s,ls=r.s;"
-            "try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k)||'';var m=scanText(k+':'+v);if(m.u&&!u)u=m.u;if(m.s&&!ds){ds=m.s;ls=m.s;}}}catch(e){}"
-            "try{for(var j=0;j<sessionStorage.length;j++){var k2=sessionStorage.key(j),v2=sessionStorage.getItem(k2)||'';var m2=scanText(k2+':'+v2);if(m2.u&&!u)u=m2.u;if(m2.s&&!ds){ds=m2.s;ls=m2.s;}}}catch(e){}"
-            "var paths=['/en/cabinet/demo-quick-high-low/','/ar/cabinet/demo-quick-high-low/','/cabinet/demo-quick-high-low/'];"
-            "for(var p=0;p<paths.length;p++){try{var f1=await fetch(paths[p],{credentials:'include'});if(f1.ok){var t1=await f1.text();var g1=scanText(t1);if(g1.s)ds=g1.s;if(g1.u&&!u)u=g1.u;if(g1.s)break;}}catch(e){}}"
-            "var lpaths=['/en/cabinet/quick-high-low/','/ar/cabinet/quick-high-low/','/cabinet/quick-high-low/'];"
-            "for(var q=0;q<lpaths.length;q++){try{var f2=await fetch(lpaths[q],{credentials:'include'});if(f2.ok){var t2=await f2.text();var g2=scanText(t2);if(g2.s)ls=g2.s;if(g2.u&&!u)u=g2.u;if(g2.s)break;}}catch(e){}}"
-            "if(sendAll(u,ds,ls))return;"
-            "var b=document.createElement('div');"
-            "b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;background:#059669;color:#fff;padding:14px;text-align:center;font-size:15px;font-weight:bold;direction:rtl;';"
-            "b.innerText='⏳ جاري انتظار اتصال المنصة... بدّل الآن بين الحساب التجريبي والحقيقي في المنصة ليتم الالتقاط تلقائيًا!';"
-            "document.body.appendChild(b);"
-            "var origSend=WebSocket.prototype.send;"
-            "WebSocket.prototype.send=function(d){"
-            "try{if(typeof d==='string'&&d.indexOf('42[\"auth\"')===0){var obj=JSON.parse(d.slice(2))[1];if(obj&&obj.session){sendAll(String(obj.uid||u),obj.session,obj.session);}}}catch(e){}"
-            "return origSend.apply(this,arguments);"
-            "};"
-            "}catch(err){alert('خطأ: '+err);}"
-            "})();"
-        )
-        return "javascript:" + payload_js
-
-    def render_mobile_connect_html(self, prefill_name: str = "") -> str:
-        safe_name = prefill_name.replace('"', "").replace("<", "").replace(">", "")
-        token_js = json.dumps(self.web_connect_token)
-        base_url_js = json.dumps(PUBLIC_BASE_URL)
-        prefill_js = json.dumps(safe_name)
-        initial_bm = self.build_bookmarklet_js(safe_name or "حساب الهاتف")
-
-        return f"""<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ربط حساب عبود تريدينج</title>
-<style>
-  * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-  body {{ margin: 0; padding: 14px; background: #0b1120; color: #f8fafc; }}
-  .card {{ max-width: 480px; margin: 0 auto; background: #131c31; border: 1px solid #1e293b; border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
-  .wv-alert {{ display: none; background: #7f1d1d; border: 1px solid #ef4444; color: #fef2f2; padding: 14px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; line-height: 1.6; }}
-  h2 {{ margin: 0 0 6px; font-size: 20px; color: #10b981; text-align: center; }}
-  p.sub {{ margin: 0 0 16px; font-size: 13px; color: #94a3b8; text-align: center; line-height: 1.5; }}
-  .step {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 12px; }}
-  .step-title {{ font-weight: 700; font-size: 14px; color: #38bdf8; margin-bottom: 8px; }}
-  input, textarea {{ width: 100%; background: #1e293b; border: 1px solid #334155; color: #fff; padding: 11px 12px; border-radius: 10px; font-size: 13px; outline: none; direction: ltr; }}
-  input#accName {{ direction: rtl; font-size: 14px; }}
-  input:focus, textarea:focus {{ border-color: #10b981; }}
-  .btn {{ display: block; width: 100%; text-align: center; padding: 13px; border-radius: 11px; font-weight: 700; font-size: 14px; text-decoration: none; border: none; cursor: pointer; margin-top: 8px; }}
-  .btn-primary {{ background: linear-gradient(135deg, #10b981, #059669); color: #fff; }}
-  .btn-blue {{ background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }}
-  .btn-amber {{ background: linear-gradient(135deg, #f59e0b, #d97706); color: #0b1120; }}
-  .btn-red {{ background: #ef4444; color: #fff; }}
-  .hint {{ font-size: 12.5px; color: #cbd5e1; line-height: 1.7; margin-top: 8px; }}
-  .badge {{ display: inline-block; background: #064e3b; color: #6ee7b7; padding: 2px 8px; border-radius: 6px; font-size: 11px; }}
-  .toast {{ display: none; background: #065f46; color: #ecfdf5; padding: 10px; border-radius: 8px; text-align: center; font-size: 13px; margin-top: 8px; line-height: 1.6; }}
-</style>
-</head>
-<body>
-<div class="card">
-  <div id="wvBanner" class="wv-alert">
-    ⚠️ <b>أنت الآن داخل متصفح تيليجرام الداخلي!</b><br>
-    لنجاح ربط الحساب على الهاتف، افتح هذه الصفحة في متصفح <b>Chrome</b> أو <b>Safari</b> الخارجي (مع تشغيل الـ VPN):
-    <button class="btn btn-red" onclick="openExternalBrowser()">🌐 فتح في متصفح Chrome / Safari الخارجي</button>
-    <button class="btn btn-amber" onclick="copyPageUrl()">📋 نسخ رابط هذه الصفحة لفتحه في المتصفح</button>
-  </div>
-
-  <h2>🛡 بوابة ربط حساب Pocket Option</h2>
-  <p class="sub">ربط مباشر من الهاتف (أندرويد / آيفون)<br><span class="badge">يحفظ الديمو + الحقيقي + الآيدي معًا</span></p>
-
-  <div class="step">
-    <div class="step-title">1️⃣ اسم الحساب (اختياري)</div>
-    <input type="text" id="accName" placeholder="مثال: حسابي الرئيسي" value="">
-  </div>
-
-  <div class="step">
-    <div class="step-title">2️⃣ نسخ كود الربط وحفظه في مفضلة المتصفح</div>
-    <p class="hint">
-      • اضغط زر <b>نسخ كود الربط السريع</b> (أو انسخه من الصندوق أدناه).<br>
-      • ثم اضغط قائمة المتصفح (<b>⋮</b> أو المشاركة) ⬅️ <b>إضافة إلى المفضلة (⭐)</b> ⬅️ <b>تعديل (Edit)</b> ⬅️ غيّر الاسم إلى <b>ربط البوت</b> والصق الكود المنسوخ في خانة <b>الرابط (URL)</b>.
-    </p>
-    <textarea id="codeBox" rows="3" readonly onclick="this.select()">{initial_bm}</textarea>
-    <button class="btn btn-amber" onclick="copySmartExtractor()">📋 نسخ كود الربط السريع (Demo + Live)</button>
-    <div id="copyToast" class="toast">✅ تم نسخ كود الربط بنجاح! احفظ هذه الصفحة في المفضلة (⭐) وعدّل الرابط (URL) بلصق الكود فيه.</div>
-  </div>
-
-  <div class="step">
-    <div class="step-title">3️⃣ تسجيل الدخول وإتمام الربط</div>
-    <p class="hint">
-      • تأكد أن الـ <b>VPN</b> يعمل، ثم افتح Pocket Option وسجّل الدخول حتى تظهر شموع التداول.<br>
-      • بعدها اضغط على شريط عنوان المتصفح، اكتب <b>ربط البوت</b>، واختر المفضلة التي حفظتها ليتم الربط والعودة للبوت فورًا!
-    </p>
-    <a href="https://pocketoption.com/en/login/" target="_blank" class="btn btn-blue">🌐 فتح تسجيل الدخول في Pocket Option</a>
-  </div>
-
-  <div class="step">
-    <div class="step-title">🔄 أو الصق كود الجلسة هنا مباشرة</div>
-    <form method="POST" action="/api/manual_web_capture">
-      <input type="hidden" name="token" value="{self.web_connect_token}">
-      <input type="hidden" name="name" id="hiddenFormName" value="">
-      <textarea name="raw_session" rows="2" placeholder='الصق هنا 42["auth",...] أو رمز session'></textarea>
-      <button type="submit" class="btn btn-primary" onclick="document.getElementById('hiddenFormName').value=document.getElementById('accName').value;">✅ حفظ وتفعيل الحساب فورًا</button>
-    </form>
-  </div>
-</div>
-
-<script>
-  const TOKEN = {token_js};
-  const BASE_URL = {base_url_js};
-  const PREFILL = {prefill_js};
-  const nameInput = document.getElementById('accName');
-  const codeBox = document.getElementById('codeBox');
-  if (PREFILL) nameInput.value = PREFILL;
-
-  const ua = navigator.userAgent || '';
-  const isAndroid = /Android/i.test(ua);
-  const isTgWebView = /Telegram/i.test(ua) || (isAndroid && /; wv\\)/i.test(ua));
-  if (isTgWebView) {{
-    document.getElementById('wvBanner').style.display = 'block';
-  }}
-
-  function openExternalBrowser() {{
-    const cleanUrl = window.location.href.replace(/^https?:\\/\\//, '');
-    if (isAndroid) {{
-      window.location.href = 'intent://' + cleanUrl + '#Intent;scheme=https;package=com.android.chrome;end';
-    }} else {{
-      copyPageUrl();
-    }}
-  }}
-
-  function fallbackCopyText(txt) {{
-    const ta = document.createElement('textarea');
-    ta.value = txt;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    let ok = false;
-    try {{ ok = document.execCommand('copy'); }} catch (e) {{}}
-    document.body.removeChild(ta);
-    return ok;
-  }}
-
-  function copyPageUrl() {{
-    const url = window.location.href;
-    if (navigator.clipboard && navigator.clipboard.writeText) {{
-      navigator.clipboard.writeText(url).then(() => {{
-        alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
-      }}).catch(() => {{
-        fallbackCopyText(url);
-        alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
-      }});
-    }} else {{
-      fallbackCopyText(url);
-      alert('✅ تم نسخ الرابط! افتح متصفح Safari أو Chrome الآن والصقه في شريط العنوان.');
-    }}
-  }}
-
-  function buildExtractorCode() {{
-    const cfgObj = {{
-      base: BASE_URL,
-      token: TOKEN,
-      name: (nameInput.value.trim() || 'حساب الهاتف')
-    }};
-    const cfgB64 = btoa(unescape(encodeURIComponent(JSON.stringify(cfgObj))));
-    const js = "(async function(){{try{{var cfg=JSON.parse(decodeURIComponent(escape(atob('" + cfgB64 + "'))));function sendAll(u,ds,ls){{if(!ds&&!ls)return false;location.href=cfg.base+'/api/mobile_capture_redirect?token='+encodeURIComponent(cfg.token)+'&name='+encodeURIComponent(cfg.name)+'&uid='+encodeURIComponent(u||'Unknown')+'&demo_s='+encodeURIComponent(ds||ls)+'&live_s='+encodeURIComponent(ls||ds);return true;}}function scanText(t){{if(!t)return{{}};var u=(t.match(/['\\\"]?uid['\\\"]?\\\\s*[:=]\\\\s*['\\\"]?(\\\\d{{5,15}})['\\\"]?/i)||t.match(/data-uid=['\\\"](\\\\d{{5,15}})['\\\"]/i)||[])[1]||'';var s=(t.match(/['\\\"]?session['\\\"]?\\\\s*[:=]\\\\s*['\\\"]([a-zA-Z0-9_-]{{16,64}})['\\\"]/i)||[])[1]||'';return{{u:u,s:s}};}}var r=scanText(document.documentElement.innerHTML);var u=r.u,ds=r.s,ls=r.s;try{{for(var i=0;i<localStorage.length;i++){{var k=localStorage.key(i),v=localStorage.getItem(k)||'';var m=scanText(k+':'+v);if(m.u&&!u)u=m.u;if(m.s&&!ds){{ds=m.s;ls=m.s;}}}}}}catch(e){{}}try{{for(var j=0;j<sessionStorage.length;j++){{var k2=sessionStorage.key(j),v2=sessionStorage.getItem(k2)||'';var m2=scanText(k2+':'+v2);if(m2.u&&!u)u=m2.u;if(m2.s&&!ds){{ds=m2.s;ls=m2.s;}}}}}}catch(e){{}}var paths=['/en/cabinet/demo-quick-high-low/','/ar/cabinet/demo-quick-high-low/','/cabinet/demo-quick-high-low/'];for(var p=0;p<paths.length;p++){{try{{var f1=await fetch(paths[p],{{credentials:'include'}});if(f1.ok){{var t1=await f1.text();var g1=scanText(t1);if(g1.s)ds=g1.s;if(g1.u&&!u)u=g1.u;if(g1.s)break;}}}}catch(e){{}}}}var lpaths=['/en/cabinet/quick-high-low/','/ar/cabinet/quick-high-low/','/cabinet/quick-high-low/'];for(var q=0;q<lpaths.length;q++){{try{{var f2=await fetch(lpaths[q],{{credentials:'include'}});if(f2.ok){{var t2=await f2.text();var g2=scanText(t2);if(g2.s)ls=g2.s;if(g2.u&&!u)u=g2.u;if(g2.s)break;}}}}catch(e){{}}}}if(sendAll(u,ds,ls))return;var b=document.createElement('div');b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;background:#059669;color:#fff;padding:14px;text-align:center;font-size:15px;font-weight:bold;direction:rtl;';b.innerText='⏳ جاري انتظار اتصال المنصة... بدّل الآن بين الحساب التجريبي والحقيقي في المنصة ليتم الالتقاط تلقائيًا!';document.body.appendChild(b);var origSend=WebSocket.prototype.send;WebSocket.prototype.send=function(d){{try{{if(typeof d==='string'&&d.indexOf('42[\\\"auth\\\"')===0){{var obj=JSON.parse(d.slice(2))[1];if(obj&&obj.session){{sendAll(String(obj.uid||u),obj.session,obj.session);}}}}}}catch(e){{}}return origSend.apply(this,arguments);}};}}catch(err){{alert('خطأ: '+err);}}}})();";
-    return 'javascript:' + js;
-  }}
-
-  function updateCodeBox() {{
-    codeBox.value = buildExtractorCode();
-  }}
-  nameInput.addEventListener('input', updateCodeBox);
-  updateCodeBox();
-
-  function copySmartExtractor() {{
-    const code = buildExtractorCode();
-    codeBox.value = code;
-    if (navigator.clipboard && navigator.clipboard.writeText) {{
-      navigator.clipboard.writeText(code).then(() => {{
-        document.getElementById('copyToast').style.display = 'block';
-      }}).catch(() => {{
-        fallbackCopyText(code);
-        document.getElementById('copyToast').style.display = 'block';
-      }});
-    }} else {{
-      fallbackCopyText(code);
-      document.getElementById('copyToast').style.display = 'block';
-    }}
-  }}
-</script>
-</body>
-</html>"""
-
-    def render_success_html(self, acc: dict) -> str:
-        return f"""<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>تم الربط بنجاح</title>
-<style>
-  body {{ margin: 0; padding: 24px; background: #0b1120; color: #f8fafc; font-family: sans-serif; text-align: center; }}
-  .box {{ max-width: 420px; margin: 40px auto; background: #131c31; border: 1px solid #10b981; border-radius: 18px; padding: 26px; }}
-  h2 {{ color: #10b981; margin-top: 0; }}
-  .info {{ background: #0f172a; padding: 14px; border-radius: 12px; margin: 16px 0; font-size: 14px; line-height: 1.8; }}
-  .btn {{ display: inline-block; background: #10b981; color: #fff; padding: 12px 24px; border-radius: 10px; text-decoration: none; font-weight: 700; }}
-</style>
-</head>
-<body>
-<div class="box">
-  <h2>✅ تم ربط الحساب بنجاح!</h2>
-  <div class="info">
-    👤 <b>اسم الحساب:</b> {acc['name']}<br>
-    🆔 <b>الآيدي (UID):</b> {acc['uid']}<br>
-    🧪 <b>الديمو (Demo):</b> جاهز ✅<br>
-    💵 <b>الحقيقي (Live):</b> جاهز ✅
-  </div>
-  <p style="color:#94a3b8;font-size:13px;">تم حفظ الحساب وتفعيله في البوت تلقائيًا. يمكنك الآن العودة إلى تليجرام والتبديل بين الديمو والحقيقي بضغطة زر.</p>
-  <a href="tg://resolve" class="btn">🔙 العودة إلى تليجرام</a>
-</div>
-</body>
-</html>"""
-
     async def start_keepalive_web_server(self):
         async def health_handler(request):
             status = "RUNNING" if self.is_running else "PAUSED"
             return web.Response(text=f"Abood Auto Trader Bot is alive! Status: {status}")
 
-        async def connect_page_handler(request):
-            token = request.query.get("token", "")
-            if token != self.web_connect_token:
-                return web.Response(text="⛔ رابط غير صالح أو منتهي الصلاحية. افتح الرابط من داخل بوت تليجرام.", status=403)
-            prefill = request.query.get("name", "")
-            return web.Response(text=self.render_mobile_connect_html(prefill), content_type="text/html", charset="utf-8")
-
-        async def mobile_capture_redirect_handler(request):
-            token = request.query.get("token", "")
-            if token != self.web_connect_token:
-                return web.Response(text="⛔ غير مصرح.", status=403)
-
-            name = request.query.get("name", "حساب الهاتف")
-            uid = request.query.get("uid", "").strip()
-            demo_s = request.query.get("demo_s", "").strip()
-            live_s = request.query.get("live_s", "").strip()
-
-            if not demo_s and not live_s:
-                return web.Response(text="⚠️ لم يتم استلام بيانات الجلسة.", status=400)
-
-            acc = self.register_captured_account(name, uid or "Unknown", demo_s, live_s)
-            self.full_reset_to_scanning("ربط حساب جديد من الهاتف")
-            log("MOBILE_AUTH", f"📱 تم ربط الحساب من الهاتف: {acc['name']} (UID: {acc['uid']}) [Demo+Live]")
-
-            asyncio.create_task(self.send_admin(
-                f"📱 <b>تم ربط حساب جديد من الهاتف بنجاح!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>الاسم:</b> {acc['name']}\n"
-                f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
-                f"🧪 <b>الديمو (Demo):</b> جاهز ✅\n"
-                f"💵 <b>الحقيقي (Live):</b> جاهز ✅\n\n"
-                f"تم تفعيل الحساب تلقائيًا؛ يمكنك التبديل بين التجريبي والحقيقي من القائمة الرئيسية.",
-                self.build_main_keyboard()
-            ))
-
-            if self.ws:
-                asyncio.create_task(self.ws.close())
-
-            return web.Response(text=self.render_success_html(acc), content_type="text/html", charset="utf-8")
-
-        async def manual_web_capture_handler(request):
-            data = await request.post()
-            token = str(data.get("token", ""))
-            if token != self.web_connect_token:
-                return web.Response(text="⛔ غير مصرح.", status=403)
-
-            name = str(data.get("name", "حساب الهاتف")).strip() or "حساب الهاتف"
-            raw = str(data.get("raw_session", "")).strip()
-            parsed = parse_auth_frame(raw)
-            if parsed is not None:
-                uid = str(parsed.get("uid", "Unknown"))
-                sess = str(parsed.get("session", ""))
-            else:
-                uid = "Unknown"
-                sess = raw
-
-            if len(sess) < 10:
-                return web.Response(text="⚠️ كود الجلسة غير صحيح. ارجع وحاول مجددًا.", status=400)
-
-            acc = self.register_captured_account(name, uid, sess, sess)
-            self.full_reset_to_scanning("ربط حساب من بوابة الهاتف")
-            asyncio.create_task(self.send_admin(
-                f"✅ <b>تم حفظ الحساب من بوابة الهاتف!</b>\n"
-                f"👤 <b>الاسم:</b> {acc['name']} | 🆔 <code>{acc['uid']}</code>",
-                self.build_main_keyboard()
-            ))
-            if self.ws:
-                asyncio.create_task(self.ws.close())
-
-            return web.Response(text=self.render_success_html(acc), content_type="text/html", charset="utf-8")
-
         app = web.Application()
         app.router.add_get("/", health_handler)
         app.router.add_get("/health", health_handler)
-        app.router.add_get("/connect", connect_page_handler)
-        app.router.add_get("/api/mobile_capture_redirect", mobile_capture_redirect_handler)
-        app.router.add_post("/api/manual_web_capture", manual_web_capture_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.getenv("PORT", "10000"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log("WEB", f"تم تشغيل خادم المراقبة وبوابة ربط الهاتف على المنفذ {port} ✅")
+        log("WEB", f"تم تشغيل خادم المراقبة على المنفذ {port} لاستضافة Render 24/7 ✅")
 
     async def run(self):
         headers = {
