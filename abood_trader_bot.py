@@ -1,21 +1,15 @@
 import asyncio
+import html
 import inspect
 import json
 import os
-import re
 import statistics
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 import aiohttp
 from aiohttp import web
 import websockets
-
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    async_playwright = None
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -26,6 +20,10 @@ if sys.stdout.encoding != "utf-8":
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
+
+# رابط خدمة الربط المنفصلة على SnapDeploy ومفتاح الأمان المشترك
+LINK_SERVICE_URL = os.getenv("LINK_SERVICE_URL", "").rstrip("/")
+LINK_WEBHOOK_SECRET = os.getenv("LINK_WEBHOOK_SECRET", "abood_secure_link_2026")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
 DEFAULT_LEAD_SECONDS = 0.1
@@ -50,7 +48,6 @@ DEFAULT_LIVE_AUTH_FRAME = os.getenv(
 
 ACCOUNTS_FILE = "accounts.json"
 STATE_FILE = "bot_state.json"
-LOCAL_PW_BROWSERS_DIR = os.path.abspath(".pw-browsers")
 
 FALLBACK_CURRENCIES = [
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
@@ -162,59 +159,6 @@ def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
     return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
 
 
-def extract_session_and_uid_from_text(html_text: str) -> tuple[str, str]:
-    if not html_text:
-        return "", ""
-    sess_match = re.search(r'["\']?session["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]{16,64})["\']', html_text)
-    uid_match = re.search(r'["\']?uid["\']?\s*[:=]\s*["\']?(\d{5,15})["\']?', html_text)
-    if not uid_match:
-        uid_match = re.search(r'data-uid=["\'](\d{5,15})["\']', html_text)
-    sess = sess_match.group(1) if sess_match else ""
-    uid = uid_match.group(1) if uid_match else ""
-    return sess, uid
-
-
-def find_existing_chromium_executable() -> str | None:
-    search_roots = [
-        LOCAL_PW_BROWSERS_DIR,
-        os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
-        "/opt/render/.cache/ms-playwright",
-        "/opt/render/project/src/.pw-browsers",
-        os.path.expanduser("~/.cache/ms-playwright"),
-    ]
-    for root in search_roots:
-        if not root or not os.path.isdir(root):
-            continue
-        for dirpath, _, filenames in os.walk(root):
-            if "chrome" in filenames:
-                exe = os.path.join(dirpath, "chrome")
-                if os.path.isfile(exe) and os.access(exe, os.X_OK):
-                    return exe
-            if "headless_shell" in filenames:
-                exe = os.path.join(dirpath, "headless_shell")
-                if os.path.isfile(exe) and os.access(exe, os.X_OK):
-                    return exe
-    return None
-
-
-def install_chromium_to_local_dir() -> str | None:
-    os.makedirs(LOCAL_PW_BROWSERS_DIR, exist_ok=True)
-    env = os.environ.copy()
-    env["PLAYWRIGHT_BROWSERS_PATH"] = LOCAL_PW_BROWSERS_DIR
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            env=env,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=240
-        )
-    except Exception as e:
-        log("PW_INSTALL_ERR", f"تعذر تثبيت Chromium تلقائيًا: {e}")
-    return find_existing_chromium_executable()
-
-
 # ==========================================
 # دوال حساب المؤشرات الفنية (بدون مكتبات خارجية)
 # ==========================================
@@ -294,7 +238,7 @@ class AboodControlBot:
 
         # الشطرنج الشديد: يقبل الشموع الصغيرة ذات اللون الواضح ويستبعد الشموع المسطحة/الهامشية
         self.strict_chess_enabled = False
-        self.strict_body_ratio = 0.25        # 25% من وسيط أجسام الشموع السابقة
+        self.strict_body_ratio = 0.25
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
@@ -334,13 +278,6 @@ class AboodControlBot:
         self.temp_new_acc_name = ""
         self.temp_new_acc_demo_frame = ""
         self._load_accounts_storage()
-
-        # متغيرات جلسة الربط المباشر عبر متصفح السيرفر (Playwright)
-        self.srv_login_task = None
-        self.srv_login_page = None
-        self.srv_login_input_event = asyncio.Event()
-        self.srv_login_last_input = ""
-        self.srv_login_cancel = False
 
         # ==========================================
         # نظام التعزيز الذكي (يعتمد على الرصيد الفعلي وقمته دون أي تهبيش)
@@ -516,10 +453,6 @@ class AboodControlBot:
     # فحص «الشطرنج الشديد» (يشمل الشموع الصغيرة ذات اللون الواضح ويستبعد المسطحة)
     # ==========================================
     def check_strict_chess_candles(self, asset: str, minutes_tuple: tuple) -> tuple[bool, str]:
-        """
-        يقبل الشموع الصغيرة والكبيرة بشرط أن يظهر فيها جسم لوني واضح (أخضر/أحمر)
-        ويستبعد الشموع المسطحة أو شبه المعدومة الجسم (الدوجي الدقيق).
-        """
         if not self.strict_chess_enabled:
             return True, "عادي"
 
@@ -536,7 +469,6 @@ class AboodControlBot:
         if not prev_bodies:
             return False, "لا توجد شموع مرجعية كافية"
 
-        # استخدام الوسيط (Median) بدل المتوسط حتى لا ترفع شمعة عملاقة الحد على الشموع الصغيرة الواضحة
         median_body = statistics.median(prev_bodies)
         min_median_threshold = median_body * self.strict_body_ratio
 
@@ -552,16 +484,13 @@ class AboodControlBot:
             b_size = abs(c_p - o_p)
             total_range = max(h_p - l_p, b_size)
 
-            # 1) رفض الشمعة المسطحة تمامًا (خط أفقي بدون جسم)
             if b_size <= 0:
                 return False, f"شمعة #{idx} مسطحة بدون جسم"
 
-            # 2) حد أدنى نسبي للسعر (يقبل الشموع الصغيرة الواضحة مثل 3 نقاط ويرفض 0-1 نقطة)
             min_price_body = c_p * 0.000015
             if b_size < min_price_body and b_size < min_median_threshold:
                 return False, f"شمعة #{idx} هامشية صغيرة جدًا"
 
-            # 3) وضوح اللون مقارنة بالذيل (ألا تكون دوجي خيطية بلا جسم مرئي)
             if total_range > 0 and (b_size / total_range) < 0.14:
                 return False, f"شمعة #{idx} دوجي غير واضحة اللون"
 
@@ -699,7 +628,6 @@ class AboodControlBot:
         }
 
     def _apply_env_default_frames(self):
-        """تحديث جلسة الديمو والحقيقي من متغيرات البيئة في Render (PO_AUTH_FRAME و PO_LIVE_AUTH_FRAME)"""
         if not self.accounts:
             return
         env_demo = parse_auth_frame(DEFAULT_AUTH_FRAME)
@@ -1354,10 +1282,11 @@ class AboodControlBot:
             {"text": "🔑 تحديث جلسة الديمو", "callback_data": "set_demo_auth"},
             {"text": "🔥 تحديث جلسة الحقيقي", "callback_data": "set_live_auth"}
         ])
-        rows.append([{
-            "text": "🤖 ربط حساب مباشر عبر السيرفر",
-            "callback_data": "srv_login_start"
-        }])
+        if LINK_SERVICE_URL:
+            rows.append([{
+                "text": "🌐 فتح بوابة الربط السحابية (SnapDeploy)",
+                "url": f"{LINK_SERVICE_URL}/connect"
+            }])
         rows.append([
             {"text": "⌨️ إضافة حساب يدوي", "callback_data": "add_account_start"},
             {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
@@ -1400,6 +1329,7 @@ class AboodControlBot:
         conn_icon = "متصل مستقر ✅" if self.authenticated else "جاري الاتصال ⏳"
 
         acc = self.get_active_account()
+        safe_acc_name = html.escape(acc["name"])
         acc_mode_str = "🧪 تجريبي (Demo)" if self.is_demo_mode else "💵 حقيقي (Live) 🔥"
         bal_label = "رصيد الديمو" if self.is_demo_mode else "الرصيد الحقيقي"
         bal_str = f"${format_money(self.account_balance)}" if self.account_balance is not None else "جاري الجلب..."
@@ -1467,7 +1397,7 @@ class AboodControlBot:
             f"♟ <b>لوحة إدارة عبود تريدينج (24/7)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة:</b> {status_icon}\n"
-            f"👤 <b>الحساب النشط:</b> <b>{acc['name']}</b> (<code>{acc['uid']}</code>)\n"
+            f"👤 <b>الحساب النشط:</b> <b>{safe_acc_name}</b> (<code>{acc['uid']}</code>)\n"
             f"🎛 <b>نوع الحساب:</b> {acc_mode_str}\n"
             f"💰 <b>{bal_label}:</b> <code>{bal_str}</code>\n"
             f"🌐 <b>السيرفر:</b> {conn_icon}\n"
@@ -1515,23 +1445,6 @@ class AboodControlBot:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         await self.tg_api("sendMessage", payload, req_timeout=15.0, retries=3)
-
-    async def send_admin_photo(self, photo_bytes: bytes, caption: str, reply_markup: dict = None):
-        if not self.http_session:
-            return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        form = aiohttp.FormData()
-        form.add_field("chat_id", str(ADMIN_CHAT_ID))
-        form.add_field("caption", caption)
-        form.add_field("parse_mode", "HTML")
-        if reply_markup:
-            form.add_field("reply_markup", json.dumps(reply_markup))
-        form.add_field("photo", photo_bytes, filename="screen.png", content_type="image/png")
-        try:
-            async with self.http_session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=25.0)) as resp:
-                await resp.json()
-        except Exception as e:
-            log("TG_PHOTO_WARN", f"تعذر إرسال لقطة الشاشة: {e}")
 
     async def send_channel(self, text: str, reply_to_message_id: int = None) -> int | None:
         if not CHANNEL_ID or "ضع_" in str(CHANNEL_ID):
@@ -1588,456 +1501,6 @@ class AboodControlBot:
                 self.reset_daily_stats()
 
     # ==========================================
-    # محرك الربط المباشر عبر متصفح السيرفر (Email/Password + Google Sign-In)
-    # ==========================================
-    def _cancel_server_login(self):
-        self.srv_login_cancel = True
-        self.srv_login_input_event.set()
-        if self.srv_login_task and not self.srv_login_task.done():
-            self.srv_login_task.cancel()
-        self.srv_login_task = None
-        self.srv_login_page = None
-        if str(self.awaiting_input or "").startswith("SRV_"):
-            self.awaiting_input = None
-
-    async def _wait_user_step_input(self, state_name: str, timeout_sec: int = 180) -> str | None:
-        self.srv_login_input_event.clear()
-        self.srv_login_last_input = ""
-        self.awaiting_input = state_name
-        try:
-            await asyncio.wait_for(self.srv_login_input_event.wait(), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            return None
-        finally:
-            if self.awaiting_input == state_name:
-                self.awaiting_input = None
-        if self.srv_login_cancel:
-            return None
-        return self.srv_login_last_input
-
-    async def _launch_server_chromium(self, pw):
-        launch_args = [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-zygote",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1280,800",
-        ]
-        exe_path = find_existing_chromium_executable()
-        if not exe_path:
-            await self.send_admin("📦 <b>تجهيز متصفح السيرفر لأول مرة...</b> يُرجى الانتظار لحظات.")
-            exe_path = await asyncio.to_thread(install_chromium_to_local_dir)
-
-        if exe_path:
-            return await pw.chromium.launch(executable_path=exe_path, headless=True, args=launch_args)
-        return await pw.chromium.launch(headless=True, args=launch_args)
-
-    async def run_server_browser_login(self, acc_name: str, login_method: str):
-        if async_playwright is None:
-            await self.send_admin(
-                "⚠️ مكتبة <code>playwright</code> غير مثبتة على السيرفر بعد.\n"
-                "أضف <code>playwright</code> في <code>requirements.txt</code> و <code>playwright install chromium</code> في أمر البناء على Render."
-            )
-            return
-
-        self.srv_login_cancel = False
-        cancel_kb = {"inline_keyboard": [[{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]]}
-
-        pw = None
-        browser = None
-        try:
-            await self.send_admin(
-                f"🌐 <b>جاري تشغيل المتصفح الآمن على السيرفر لحساب ({acc_name})...</b>\n"
-                f"⏳ يُرجى الانتظار بضع ثوانٍ.",
-                cancel_kb
-            )
-
-            pw = await async_playwright().start()
-            browser = await self._launch_server_chromium(pw)
-
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-                locale="en-US"
-            )
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-
-            # حظر الصور والوسائط والخطوط وملفات التتبع لتسريع التحميل على السيرفر وتجنب Timeout
-            async def fast_route_handler(route):
-                req_type = route.request.resource_type
-                req_url = route.request.url.lower()
-                if req_type in ("image", "media", "font"):
-                    await route.abort()
-                elif any(x in req_url for x in ("google-analytics", "googletagmanager", "facebook", "doubleclick", "yandex", "hotjar")):
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await context.route("**/*", fast_route_handler)
-
-            page = await context.new_page()
-            self.srv_login_page = page
-
-            captured_ws = {"session": "", "uid": ""}
-
-            def attach_ws_listener(target_page):
-                def on_ws(ws):
-                    def on_frame(payload):
-                        if isinstance(payload, str) and payload.startswith('42["auth",'):
-                            parsed = parse_auth_frame(payload)
-                            if parsed and parsed.get("session"):
-                                captured_ws["session"] = str(parsed["session"])
-                                if parsed.get("uid"):
-                                    captured_ws["uid"] = str(parsed["uid"])
-                    ws.on("framesent", on_frame)
-                target_page.on("websocket", on_ws)
-
-            attach_ws_listener(page)
-            context.on("page", attach_ws_listener)
-
-            login_urls = [
-                "https://pocketoption.com/en/login/",
-                "https://po.trade/en/login/",
-                "https://pocketoption.com/login/"
-            ]
-            loaded_ok = False
-            last_nav_err = None
-            for target_url in login_urls:
-                try:
-                    await page.goto(target_url, wait_until="commit", timeout=25000)
-                    await page.wait_for_selector(
-                        'input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")',
-                        timeout=20000
-                    )
-                    loaded_ok = True
-                    break
-                except Exception as nav_e:
-                    last_nav_err = nav_e
-                    continue
-
-            if not loaded_ok:
-                try:
-                    shot = await page.screenshot(type="png")
-                    await self.send_admin_photo(
-                        shot,
-                        f"⚠️ <b>تعذر تحميل نموذج الدخول من سيرفر Render حاليًا:</b>\n"
-                        f"<code>{str(last_nav_err).splitlines()[0][:140]}</code>\n\n"
-                        f"💡 يمكنك استخدام أزرار <b>🔑 تحديث جلسة الديمو</b> و <b>🔥 تحديث جلسة الحقيقي</b> لإدخالهما مباشرةً في ثوانٍ.",
-                        self.build_accounts_keyboard()
-                    )
-                except Exception:
-                    await self.send_admin(
-                        "⚠️ تعذر فتح صفحة تسجيل الدخول من سيرفر Render حاليًا. يمكنك إدخال رمز الديمو أو الحقيقي يدويًا من أزرار إدارة الحسابات.",
-                        self.build_accounts_keyboard()
-                    )
-                return
-
-            # ==================================================
-            # المسار أ: تسجيل الدخول عبر Google (Google Automation)
-            # ==================================================
-            if login_method == "GOOGLE":
-                google_selectors = [
-                    'a[href*="google"]',
-                    'button:has-text("Google")',
-                    'a:has-text("Google")',
-                    '.social-btn--google',
-                    '[data-provider="google"]'
-                ]
-                clicked_google = False
-                popup_page = None
-
-                for sel in google_selectors:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0:
-                        try:
-                            async with context.expect_page(timeout=4000) as popup_info:
-                                await loc.click(timeout=5000)
-                            popup_page = await popup_info.value
-                        except Exception:
-                            try:
-                                await loc.click(timeout=5000)
-                            except Exception:
-                                continue
-                        clicked_google = True
-                        break
-
-                if not clicked_google:
-                    shot = await page.screenshot(type="png")
-                    await self.send_admin_photo(
-                        shot,
-                        "⚠️ لم يظهر زر Google مباشرة في الصفحة. تأكد من الصفحة أو أعد المحاولة.",
-                        cancel_kb
-                    )
-                    return
-
-                active_p = popup_page if popup_page else page
-                await active_p.wait_for_load_state("domcontentloaded", timeout=25000)
-                await active_p.wait_for_timeout(1500)
-
-                shot = await active_p.screenshot(type="png")
-                await self.send_admin_photo(
-                    shot,
-                    "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\n"
-                    "أرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
-                    cancel_kb
-                )
-
-                g_email = await self._wait_user_step_input("SRV_GOOGLE_EMAIL", timeout_sec=180)
-                if not g_email:
-                    return
-
-                email_inp = active_p.locator('input[type="email"]').first
-                await email_inp.wait_for(state="visible", timeout=15000)
-                await email_inp.fill(g_email.strip())
-                await active_p.keyboard.press("Enter")
-                await active_p.wait_for_timeout(3000)
-
-                pass_inp = active_p.locator('input[type="password"]').first
-                if await pass_inp.count() == 0:
-                    shot = await active_p.screenshot(type="png")
-                    await self.send_admin_photo(
-                        shot,
-                        "⚠️ <b>تنبيه من Google:</b>\n"
-                        "لم يظهر حقل كلمة المرور بعد (ربما يوجد تحقق أمني). أرسل النص المطلوب أو اضغط تحديث اللقطة:",
-                        {
-                            "inline_keyboard": [
-                                [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
-                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
-                            ]
-                        }
-                    )
-                    retry_txt = await self._wait_user_step_input("SRV_GOOGLE_2FA", timeout_sec=180)
-                    if not retry_txt:
-                        return
-                    any_inp = active_p.locator('input:visible').first
-                    if await any_inp.count() > 0:
-                        await any_inp.fill(retry_txt.strip())
-                        await active_p.keyboard.press("Enter")
-                        await active_p.wait_for_timeout(3000)
-
-                pass_inp = active_p.locator('input[type="password"]').first
-                if await pass_inp.count() > 0:
-                    await self.send_admin(
-                        "🔒 <b>تسجيل الدخول عبر Google — الخطوة 2:</b>\n"
-                        "أرسل الآن <b>كلمة مرور حساب Google</b> (سيتم حذف رسالتك فور استلامها للحماية):",
-                        cancel_kb
-                    )
-                    g_pass = await self._wait_user_step_input("SRV_GOOGLE_PASS", timeout_sec=180)
-                    if not g_pass:
-                        return
-
-                    await pass_inp.fill(g_pass)
-                    await active_p.keyboard.press("Enter")
-                    await active_p.wait_for_timeout(3500)
-
-                for _ in range(18):
-                    if self.srv_login_cancel or captured_ws["session"]:
-                        break
-                    if ("pocketoption.com" in page.url or "po.trade" in page.url) and "/login" not in page.url:
-                        break
-
-                    cur_p = active_p if not active_p.is_closed() else page
-                    cur_url = cur_p.url
-                    if "accounts.google.com" in cur_url and ("challenge" in cur_url or "signin" in cur_url):
-                        shot = await cur_p.screenshot(type="png")
-                        code_inp = cur_p.locator('input[type="tel"], input[name="totpPin"], input[id*="pin"]').first
-                        if await code_inp.count() > 0:
-                            await self.send_admin_photo(
-                                shot,
-                                "📲 <b>التحقق بخطوتين من Google:</b>\n"
-                                "أرسل الآن <b>رمز التحقق</b> الظاهر في رسالتك أو تطبيق المصادقة:",
-                                cancel_kb
-                            )
-                            otp_code = await self._wait_user_step_input("SRV_GOOGLE_2FA", timeout_sec=180)
-                            if not otp_code:
-                                return
-                            await code_inp.fill(otp_code.strip())
-                            await cur_p.keyboard.press("Enter")
-                            await cur_p.wait_for_timeout(3000)
-                        else:
-                            await self.send_admin_photo(
-                                shot,
-                                "📱 <b>تأكيد الدخول من هاتفك:</b>\n"
-                                "إذا ظهرت لك رسالة تأكيد من Google على هاتفك، اضغط <b>نعم (Yes)</b> واختر الرقم المطابق الظاهر في الصورة أعلاه.\n"
-                                "⏳ البوت ينتظر إتمام التأكيد تلقائيًا...",
-                                {
-                                    "inline_keyboard": [
-                                        [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
-                                        [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
-                                    ]
-                                }
-                            )
-                            await cur_p.wait_for_timeout(4500)
-                    else:
-                        await page.wait_for_timeout(1500)
-
-            # ==================================================
-            # المسار ب: تسجيل الدخول بالبريد الإلكتروني وكلمة المرور
-            # ==================================================
-            else:
-                await self.send_admin(
-                    "📧 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 1:</b>\n"
-                    "أرسل الآن <b>البريد الإلكتروني</b> المسجل في Pocket Option:",
-                    cancel_kb
-                )
-                po_email = await self._wait_user_step_input("SRV_PO_EMAIL", timeout_sec=180)
-                if not po_email:
-                    return
-
-                await self.send_admin(
-                    "🔒 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 2:</b>\n"
-                    "أرسل الآن <b>كلمة المرور</b> (سيتم حذف رسالتك فور استلامها للحماية):",
-                    cancel_kb
-                )
-                po_pass = await self._wait_user_step_input("SRV_PO_PASS", timeout_sec=180)
-                if not po_pass:
-                    return
-
-                email_field = page.locator('input[name="email"], input[type="email"]').first
-                pass_field = page.locator('input[name="password"], input[type="password"]').first
-                await email_field.wait_for(state="visible", timeout=15000)
-                await email_field.fill(po_email.strip())
-                await pass_field.fill(po_pass)
-
-                submit_btn = page.locator('button[type="submit"], input[type="submit"]').first
-                if await submit_btn.count() > 0:
-                    await submit_btn.click()
-                else:
-                    await page.keyboard.press("Enter")
-
-                await page.wait_for_timeout(3500)
-
-                if "/login" in page.url and not captured_ws["session"]:
-                    shot = await page.screenshot(type="png")
-                    await self.send_admin_photo(
-                        shot,
-                        "⏳ <b>جاري التحقق من إتمام الدخول...</b>\n"
-                        "إذا ظهر رمز تحقق (2FA) أرسله هنا الآن، أو انتظر لحظات لإتمام الاتصال:",
-                        {
-                            "inline_keyboard": [
-                                [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "srv_login_shot"}],
-                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
-                            ]
-                        }
-                    )
-                    for _ in range(12):
-                        if self.srv_login_cancel or captured_ws["session"] or "/login" not in page.url:
-                            break
-                        await page.wait_for_timeout(1500)
-
-            if self.srv_login_cancel:
-                return
-
-            await page.wait_for_timeout(2000)
-            html_content = await page.content()
-            demo_sess, uid_val = extract_session_and_uid_from_text(html_content)
-            live_sess = ""
-
-            if captured_ws["session"]:
-                demo_sess = demo_sess or captured_ws["session"]
-            if captured_ws["uid"]:
-                uid_val = uid_val or captured_ws["uid"]
-
-            try:
-                res_both = await page.evaluate("""async () => {
-                    let out = {demo: '', live: '', uid: ''};
-                    const grab = (t) => {
-                        let u = (t.match(/["']?uid["']?\\s*[:=]\\s*["']?(\\d{5,15})["']?/i) || [])[1] || '';
-                        let s = (t.match(/["']?session["']?\\s*[:=]\\s*["']([a-zA-Z0-9_-]{16,64})["']/i) || [])[1] || '';
-                        return {u, s};
-                    };
-                    try {
-                        let r1 = await fetch('/en/cabinet/demo-quick-high-low/', {credentials: 'include'});
-                        if (r1.ok) {
-                            let g1 = grab(await r1.text());
-                            if (g1.s) out.demo = g1.s;
-                            if (g1.u) out.uid = g1.u;
-                        }
-                    } catch(e) {}
-                    try {
-                        let r2 = await fetch('/en/cabinet/quick-high-low/', {credentials: 'include'});
-                        if (r2.ok) {
-                            let g2 = grab(await r2.text());
-                            if (g2.s) out.live = g2.s;
-                            if (g2.u && !out.uid) out.uid = g2.u;
-                        }
-                    } catch(e) {}
-                    return out;
-                }""")
-                if isinstance(res_both, dict):
-                    if res_both.get("demo"):
-                        demo_sess = res_both["demo"]
-                    if res_both.get("live"):
-                        live_sess = res_both["live"]
-                    if res_both.get("uid") and not uid_val:
-                        uid_val = res_both["uid"]
-            except Exception:
-                pass
-
-            if not demo_sess and not live_sess:
-                shot = await page.screenshot(type="png")
-                await self.send_admin_photo(
-                    shot,
-                    "⚠️ <b>تعذر إتمام الربط التلقائي:</b>\n"
-                    "تأكد من صحة بيانات الدخول أو رمز التحقق ثم أعد المحاولة.",
-                    self.build_accounts_keyboard()
-                )
-                return
-
-            acc = self.register_captured_account(
-                acc_name,
-                uid_val or "Unknown",
-                demo_sess or live_sess,
-                live_sess
-            )
-            self.full_reset_to_scanning("ربط حساب جديد عبر متصفح السيرفر")
-            log("SRV_AUTH", f"🤖 تم ربط الحساب بنجاح عبر متصفح السيرفر: {acc['name']} (UID: {acc['uid']})")
-
-            live_note = "جاهز ومتصل ✅" if acc.get("has_dedicated_live") else "يُرجى إضافة جلسة الحقيقي من إدارة الحسابات ⚠️"
-            await self.send_admin(
-                f"🎉 <b>تم ربط حسابك بالبوت بنجاح!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>اسم الحساب:</b> {acc['name']}\n"
-                f"🆔 <b>رقم الحساب (UID):</b> <code>{acc['uid']}</code>\n"
-                f"🧪 <b>الحساب التجريبي (Demo):</b> جاهز ومتصل ✅\n"
-                f"💵 <b>الحساب الحقيقي (Live):</b> {live_note}\n"
-                f"🔒 <b>الأمان:</b> تم إغلاق المتصفح ومسح بيانات الدخول من الذاكرة.",
-                self.build_main_keyboard()
-            )
-
-            if self.ws:
-                await self.ws.close()
-
-        except asyncio.CancelledError:
-            log("SRV_AUTH", "تم إلغاء جلسة الربط على السيرفر.")
-        except Exception as e:
-            err_short = str(e).splitlines()[0][:160] if str(e) else type(e).__name__
-            log("SRV_AUTH_ERR", f"خطأ أثناء الربط عبر السيرفر: {err_short}")
-            await self.send_admin(
-                f"⚠️ حدث خطأ أثناء الاتصال بالمنصة على السيرفر:\n<code>{err_short}</code>",
-                self.build_accounts_keyboard()
-            )
-        finally:
-            self.srv_login_page = None
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            if pw:
-                try:
-                    await pw.stop()
-                except Exception:
-                    pass
-
-    # ==========================================
     # حلقة استقبال أوامر وأزرار تليجرام
     # ==========================================
     async def telegram_polling_loop(self):
@@ -2080,72 +1543,6 @@ class AboodControlBot:
                             continue
 
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
-
-                        if data == "srv_login_start":
-                            self._cancel_server_login()
-                            self.awaiting_input = "SRV_ACC_NAME"
-                            await self.send_admin(
-                                "🤖 <b>ربط حساب مباشر عبر السيرفر (بدون روابط أو VPN)</b>\n"
-                                "━━━━━━━━━━━━━━━━━━━━\n"
-                                "1️⃣ أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>) أو اضغط تخطي:",
-                                {
-                                    "inline_keyboard": [
-                                        [{"text": "⏭ تخطي (اسم تلقائي)", "callback_data": "srv_login_skip_name"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
-                            )
-                            continue
-                        elif data == "srv_login_skip_name":
-                            self.temp_new_acc_name = f"حساب {len(self.accounts) + 1}"
-                            self.awaiting_input = None
-                            await self.tg_api("editMessageText", {
-                                "chat_id": ADMIN_CHAT_ID,
-                                "message_id": msg_id,
-                                "text": (
-                                    f"👤 <b>الحساب:</b> {self.temp_new_acc_name}\n"
-                                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:"
-                                ),
-                                "parse_mode": "HTML",
-                                "reply_markup": {
-                                    "inline_keyboard": [
-                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "srv_method_GOOGLE"}],
-                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "srv_method_EMAIL"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
-                            })
-                            continue
-                        elif data.startswith("srv_method_"):
-                            method_choice = data.replace("srv_method_", "")
-                            self._cancel_server_login()
-                            acc_nm = self.temp_new_acc_name or f"حساب {len(self.accounts) + 1}"
-                            self.srv_login_task = asyncio.create_task(
-                                self.run_server_browser_login(acc_nm, method_choice)
-                            )
-                            continue
-                        elif data == "srv_login_shot":
-                            if self.srv_login_page and not self.srv_login_page.is_closed():
-                                try:
-                                    shot = await self.srv_login_page.screenshot(type="png")
-                                    await self.send_admin_photo(
-                                        shot,
-                                        "📸 <b>لقطة الشاشة الحالية من متصفح السيرفر:</b>",
-                                        {
-                                            "inline_keyboard": [
-                                                [{"text": "📸 تحديث اللقطة", "callback_data": "srv_login_shot"}],
-                                                [{"text": "❌ إلغاء العملية", "callback_data": "srv_login_cancel"}]
-                                            ]
-                                        }
-                                    )
-                                except Exception:
-                                    pass
-                            continue
-                        elif data == "srv_login_cancel":
-                            self._cancel_server_login()
-                            await self.send_admin("❌ تم إلغاء عملية ربط الحساب وإغلاق المتصفح.", self.build_accounts_keyboard())
-                            continue
 
                         if data == "cmd_start":
                             self.is_running = True
@@ -2348,6 +1745,7 @@ class AboodControlBot:
                         elif data == "toggle_account_mode":
                             if self.is_demo_mode:
                                 acc = self.get_active_account()
+                                safe_acc_name = html.escape(acc["name"])
                                 if not acc.get("has_dedicated_live"):
                                     await self.tg_api("editMessageText", {
                                         "chat_id": ADMIN_CHAT_ID,
@@ -2355,7 +1753,7 @@ class AboodControlBot:
                                         "text": (
                                             f"⚠️ <b>تنبيه: الحساب الحقيقي غير مضبوط بعد!</b>\n"
                                             f"━━━━━━━━━━━━━━━━━━━━\n"
-                                            f"👤 <b>الحساب:</b> {acc['name']} (<code>{acc['uid']}</code>)\n\n"
+                                            f"👤 <b>الحساب:</b> {safe_acc_name} (<code>{acc['uid']}</code>)\n\n"
                                             f"لأن جلسة الحساب الحقيقي منفصلة عن الديمو، يرجى أولاً إضافة متغير <code>PO_LIVE_AUTH_FRAME</code> في Render أو الضغط على <b>🔥 تحديث جلسة الحقيقي</b> وإرسال رمز جلسة الحقيقي (<code>isDemo:0</code>)."
                                         ),
                                         "parse_mode": "HTML",
@@ -2374,7 +1772,7 @@ class AboodControlBot:
                                     "text": (
                                         f"⚠️ <b>تنبيه أمان — التحويل للحساب الحقيقي (Live)</b>\n"
                                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"👤 <b>الحساب:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                        f"👤 <b>الحساب:</b> {safe_acc_name} (<code>{acc['uid']}</code>)\n"
                                         f"💵 <b>المبلغ الأساسي الحالي:</b> <code>${self.base_amount:g}</code>\n\n"
                                         f"هل أنت متأكد من تفعيل التداول على <b>الحساب الحقيقي</b>؟"
                                     ),
@@ -2411,6 +1809,7 @@ class AboodControlBot:
                                 await self.ws.close()
                         elif data == "menu_accounts":
                             acc = self.get_active_account()
+                            safe_acc_name = html.escape(acc["name"])
                             live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
@@ -2418,7 +1817,7 @@ class AboodControlBot:
                                 "text": (
                                     f"👤 <b>إدارة حسابات Pocket Option</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"🔹 <b>الحساب النشط:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                    f"🔹 <b>الحساب النشط:</b> {safe_acc_name} (<code>{acc['uid']}</code>)\n"
                                     f"🧪 <b>جلسة الديمو:</b> مضبوطة ✅\n"
                                     f"💵 <b>جلسة الحقيقي:</b> {live_st}\n"
                                     f"🔹 <b>الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>"
@@ -2430,16 +1829,18 @@ class AboodControlBot:
                         elif data == "set_demo_auth":
                             self.awaiting_input = "SET_DEMO_AUTH"
                             acc = self.get_active_account()
+                            safe_acc_name = html.escape(acc["name"])
                             await self.send_admin(
-                                f'🧪 أرسل الآن كود جلسة <b>الديمو (Demo)</b> للحساب <b>{acc["name"]}</b>:\n'
+                                f'🧪 أرسل الآن كود جلسة <b>الديمو (Demo)</b> للحساب <b>{safe_acc_name}</b>:\n'
                                 f'<code>42["auth",{"session":"...","isDemo":1,...}]</code>'
                             )
                             continue
                         elif data == "set_live_auth":
                             self.awaiting_input = "SET_LIVE_AUTH"
                             acc = self.get_active_account()
+                            safe_acc_name = html.escape(acc["name"])
                             await self.send_admin(
-                                f'🔥 أرسل الآن كود جلسة <b>الحقيقي (Live)</b> للحساب <b>{acc["name"]}</b>:\n'
+                                f'🔥 أرسل الآن كود جلسة <b>الحقيقي (Live)</b> للحساب <b>{safe_acc_name}</b>:\n'
                                 f'<code>42["auth",{"session":"...","isDemo":0,...}]</code>'
                             )
                             continue
@@ -2477,7 +1878,7 @@ class AboodControlBot:
                                 self.full_reset_to_scanning("إضافة حساب جديد (ديمو)")
                                 await self.send_admin(
                                     f"✅ <b>تم حفظ الحساب (Demo) بنجاح!</b>\n"
-                                    f"👤 <b>الاسم:</b> {new_acc['name']} | 🆔 <code>{uid}</code>",
+                                    f"👤 <b>الاسم:</b> {html.escape(new_acc['name'])} | 🆔 <code>{uid}</code>",
                                     self.build_main_keyboard()
                                 )
                                 if self.ws:
@@ -2513,13 +1914,14 @@ class AboodControlBot:
                             except ValueError:
                                 pass
                             acc = self.get_active_account()
+                            safe_acc_name = html.escape(acc["name"])
                             await self.tg_api("editMessageText", {
                                 "chat_id": ADMIN_CHAT_ID,
                                 "message_id": msg_id,
                                 "text": (
                                     f"👤 <b>إدارة حسابات Pocket Option</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"🔹 <b>الحساب النشط حاليًا:</b> {acc['name']} (<code>{acc['uid']}</code>)\n"
+                                    f"🔹 <b>الحساب النشط حاليًا:</b> {safe_acc_name} (<code>{acc['uid']}</code>)\n"
                                     f"🔹 <b>عدد الحسابات المحفوظة:</b> <code>{len(self.accounts)}</code>"
                                 ),
                                 "parse_mode": "HTML",
@@ -2597,14 +1999,13 @@ class AboodControlBot:
                     elif "message" in update:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
-                        msg_id_user = msg.get("message_id")
                         if chat_id != str(ADMIN_CHAT_ID):
                             continue
 
                         fwd_chat = msg.get("forward_from_chat")
                         if fwd_chat and fwd_chat.get("type") == "channel":
                             ch_id = fwd_chat.get("id")
-                            ch_title = fwd_chat.get("title", "القناة")
+                            ch_title = html.escape(fwd_chat.get("title", "القناة"))
                             await self.send_admin(
                                 f"🆔 <b>تم استخراج آيدي القناة:</b>\n"
                                 f"📢 <b>القناة:</b> {ch_title}\n"
@@ -2617,7 +2018,6 @@ class AboodControlBot:
                             continue
 
                         if text in ("/start", "/menu", "القائمة"):
-                            self._cancel_server_login()
                             self.awaiting_input = None
                             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
                             continue
@@ -2640,31 +2040,6 @@ class AboodControlBot:
                                 f"✅ تم تصفير التعزيز وإعادة المبلغ الأساسي إلى <b>${self.base_amount:g}</b>.",
                                 self.build_main_keyboard()
                             )
-                            continue
-
-                        if self.awaiting_input == "SRV_ACC_NAME":
-                            self.temp_new_acc_name = text[:30]
-                            self.awaiting_input = None
-                            await self.send_admin(
-                                f"👤 <b>الحساب:</b> {self.temp_new_acc_name}\n"
-                                f"━━━━━━━━━━━━━━━━━━━━\n"
-                                f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:",
-                                {
-                                    "inline_keyboard": [
-                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "srv_method_GOOGLE"}],
-                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "srv_method_EMAIL"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
-                            )
-                            continue
-
-                        if self.awaiting_input in ("SRV_GOOGLE_EMAIL", "SRV_GOOGLE_PASS", "SRV_GOOGLE_2FA", "SRV_PO_EMAIL", "SRV_PO_PASS"):
-                            cur_state = self.awaiting_input
-                            self.srv_login_last_input = text
-                            self.srv_login_input_event.set()
-                            if cur_state in ("SRV_GOOGLE_PASS", "SRV_PO_PASS") and msg_id_user:
-                                asyncio.create_task(self.tg_api("deleteMessage", {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id_user}, req_timeout=10.0, retries=1))
                             continue
 
                         if self.awaiting_input == "SET_DEMO_AUTH":
@@ -2700,7 +2075,7 @@ class AboodControlBot:
                             self.temp_new_acc_name = text[:30]
                             self.awaiting_input = "ADD_ACC_DEMO"
                             await self.send_admin(
-                                f"🧪 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 2 من 3:</b>\n"
+                                f"🧪 <b>إضافة حساب ({html.escape(self.temp_new_acc_name)}) — الخطوة 2 من 3:</b>\n"
                                 f'أرسل الآن كود جلسة <b>الديمو (Demo)</b> (<code>42["auth",...]</code>):'
                             )
 
@@ -2710,7 +2085,7 @@ class AboodControlBot:
                                 self.temp_new_acc_demo_frame = text.strip()
                                 self.awaiting_input = "ADD_ACC_LIVE"
                                 await self.send_admin(
-                                    f"🔥 <b>إضافة حساب ({self.temp_new_acc_name}) — الخطوة 3 من 3:</b>\n"
+                                    f"🔥 <b>إضافة حساب ({html.escape(self.temp_new_acc_name)}) — الخطوة 3 من 3:</b>\n"
                                     f'أرسل الآن كود جلسة <b>الحقيقي (Live)</b> (<code>42["auth",...]</code>) أو اضغط تخطي:',
                                     {
                                         "inline_keyboard": [
@@ -2733,7 +2108,7 @@ class AboodControlBot:
                                 self.full_reset_to_scanning("إضافة حساب جديد (Demo+Live)")
                                 await self.send_admin(
                                     f"✅ <b>تم حفظ وتفعيل الحساب بالكامل (Demo + Live)!</b>\n"
-                                    f"👤 <b>الاسم:</b> {new_acc['name']} | 🆔 <code>{uid}</code>",
+                                    f"👤 <b>الاسم:</b> {html.escape(new_acc['name'])} | 🆔 <code>{uid}</code>",
                                     self.build_main_keyboard()
                                 )
                                 if self.ws:
@@ -3911,23 +3286,63 @@ class AboodControlBot:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
-    # خادم الويب المدمج لإبقاء الاستضافة المجانية على Render نشطة 24/7
+    # خادم الويب المدمج ومستقبل الربط السحابي (SnapDeploy Webhook)
     # ==========================================
     async def start_keepalive_web_server(self):
         async def health_handler(request):
             status = "RUNNING" if self.is_running else "PAUSED"
             return web.Response(text=f"Abood Auto Trader Bot is alive! Status: {status}")
 
+        async def webhook_link_account_handler(request):
+            secret = request.headers.get("X-Link-Secret", "")
+            if not LINK_WEBHOOK_SECRET or secret != LINK_WEBHOOK_SECRET:
+                return web.Response(text="Unauthorized", status=401)
+
+            try:
+                data = await request.json()
+            except Exception:
+                return web.Response(text="Invalid JSON", status=400)
+
+            name = str(data.get("name", "حساب الهاتف")).strip() or "حساب الهاتف"
+            uid = str(data.get("uid", "Unknown")).strip() or "Unknown"
+            demo_s = str(data.get("demo_session", "")).strip()
+            live_s = str(data.get("live_session", "")).strip()
+
+            if not demo_s and not live_s:
+                return web.Response(text="Missing session", status=400)
+
+            acc = self.register_captured_account(name, uid, demo_s, live_s)
+            self.full_reset_to_scanning("ربط حساب عبر SnapDeploy")
+            log("WEBHOOK_AUTH", f"🌐 تم استلام وربط الحساب: {acc['name']} (UID: {acc['uid']})")
+
+            safe_name = html.escape(acc["name"])
+            live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
+            asyncio.create_task(self.send_admin(
+                f"🌐 <b>تم ربط حساب جديد عبر بوابة SnapDeploy!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>الاسم:</b> {safe_name}\n"
+                f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
+                f"🧪 <b>الديمو (Demo):</b> مضبوطة ✅\n"
+                f"💵 <b>الحقيقي (Live):</b> {live_st}",
+                self.build_main_keyboard()
+            ))
+
+            if self.ws:
+                asyncio.create_task(self.ws.close())
+
+            return web.json_response({"ok": True, "uid": acc["uid"]})
+
         app = web.Application()
         app.router.add_get("/", health_handler)
         app.router.add_get("/health", health_handler)
+        app.router.add_post("/api/webhook/link_account", webhook_link_account_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.getenv("PORT", "10000"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log("WEB", f"تم تشغيل خادم المراقبة على المنفذ {port} لاستضافة Render 24/7 ✅")
+        log("WEB", f"تم تشغيل خادم المراقبة ومستقبل الربط على المنفذ {port} ✅")
 
     async def run(self):
         headers = {
