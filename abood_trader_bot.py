@@ -1278,15 +1278,16 @@ class AboodControlBot:
                 "callback_data": f"select_acc_{idx}"
             }])
 
+        if LINK_SERVICE_URL:
+            rows.append([{
+                "text": "🤖 ربط تلقائي (بريد / Google) عبر SnapDeploy",
+                "callback_data": "sd_login_start"
+            }])
+
         rows.append([
             {"text": "🔑 تحديث جلسة الديمو", "callback_data": "set_demo_auth"},
             {"text": "🔥 تحديث جلسة الحقيقي", "callback_data": "set_live_auth"}
         ])
-        if LINK_SERVICE_URL:
-            rows.append([{
-                "text": "🌐 فتح بوابة الربط السحابية (SnapDeploy)",
-                "url": f"{LINK_SERVICE_URL}/connect"
-            }])
         rows.append([
             {"text": "⌨️ إضافة حساب يدوي", "callback_data": "add_account_start"},
             {"text": "🗑️ حذف حساب", "callback_data": "menu_delete_account"}
@@ -1501,7 +1502,7 @@ class AboodControlBot:
                 self.reset_daily_stats()
 
     # ==========================================
-    # حلقة استقبال أوامر وأزرار تليجرام
+    # حلقة استقبال أوامر وأزرار تليجرام + تمرير خطوات الربط إلى SnapDeploy
     # ==========================================
     async def telegram_polling_loop(self):
         offset = 0
@@ -1543,6 +1544,73 @@ class AboodControlBot:
                             continue
 
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
+
+                        # أزرار الربط التلقائي عبر SnapDeploy
+                        if data == "sd_login_start":
+                            self.awaiting_input = "SD_ACC_NAME"
+                            await self.send_admin(
+                                "🤖 <b>ربط تلقائي عبر متصفح SnapDeploy السحابي</b>\n"
+                                "━━━━━━━━━━━━━━━━━━━━\n"
+                                "1️⃣ أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>) أو اضغط تخطي:",
+                                {
+                                    "inline_keyboard": [
+                                        [{"text": "⏭ تخطي (اسم تلقائي)", "callback_data": "sd_skip_name"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            )
+                            continue
+                        elif data == "sd_skip_name":
+                            self.temp_new_acc_name = f"حساب {len(self.accounts) + 1}"
+                            self.awaiting_input = None
+                            await self.tg_api("editMessageText", {
+                                "chat_id": ADMIN_CHAT_ID,
+                                "message_id": msg_id,
+                                "text": (
+                                    f"👤 <b>الحساب:</b> {html.escape(self.temp_new_acc_name)}\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:"
+                                ),
+                                "parse_mode": "HTML",
+                                "reply_markup": {
+                                    "inline_keyboard": [
+                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "sd_method_GOOGLE"}],
+                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "sd_method_EMAIL"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            })
+                            continue
+                        elif data.startswith("sd_method_"):
+                            method_choice = data.replace("sd_method_", "")
+                            acc_nm = self.temp_new_acc_name or f"حساب {len(self.accounts) + 1}"
+                            self.awaiting_input = "SD_ACTIVE_FLOW"
+                            try:
+                                async with self.http_session.post(
+                                    f"{LINK_SERVICE_URL}/api/start_login",
+                                    json={"name": acc_nm, "method": method_choice},
+                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
+                                    timeout=aiohttp.ClientTimeout(total=20)
+                                ) as resp:
+                                    if resp.status != 200:
+                                        self.awaiting_input = None
+                                        await self.send_admin("⚠️ تعذر تشغيل خدمة الربط على SnapDeploy. تأكد من تشغيل الخدمة هناك.")
+                            except Exception as e:
+                                self.awaiting_input = None
+                                await self.send_admin(f"⚠️ تعذر الاتصال بخدمة SnapDeploy: <code>{type(e).__name__}</code>")
+                            continue
+                        elif data in ("sd_cancel", "sd_shot"):
+                            kind_str = "CANCEL" if data == "sd_cancel" else "SHOT"
+                            if data == "sd_cancel":
+                                self.awaiting_input = None
+                            if LINK_SERVICE_URL:
+                                asyncio.create_task(self.http_session.post(
+                                    f"{LINK_SERVICE_URL}/api/forward_input",
+                                    json={"kind": kind_str},
+                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ))
+                            continue
 
                         if data == "cmd_start":
                             self.is_running = True
@@ -1999,6 +2067,7 @@ class AboodControlBot:
                     elif "message" in update:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
+                        msg_id_user = msg.get("message_id")
                         if chat_id != str(ADMIN_CHAT_ID):
                             continue
 
@@ -2018,6 +2087,13 @@ class AboodControlBot:
                             continue
 
                         if text in ("/start", "/menu", "القائمة"):
+                            if self.awaiting_input == "SD_ACTIVE_FLOW" and LINK_SERVICE_URL:
+                                asyncio.create_task(self.http_session.post(
+                                    f"{LINK_SERVICE_URL}/api/forward_input",
+                                    json={"kind": "CANCEL"},
+                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ))
                             self.awaiting_input = None
                             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
                             continue
@@ -2040,6 +2116,43 @@ class AboodControlBot:
                                 f"✅ تم تصفير التعزيز وإعادة المبلغ الأساسي إلى <b>${self.base_amount:g}</b>.",
                                 self.build_main_keyboard()
                             )
+                            continue
+
+                        if self.awaiting_input == "SD_ACC_NAME":
+                            self.temp_new_acc_name = text[:30]
+                            self.awaiting_input = None
+                            await self.send_admin(
+                                f"👤 <b>الحساب:</b> {html.escape(self.temp_new_acc_name)}\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:",
+                                {
+                                    "inline_keyboard": [
+                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "sd_method_GOOGLE"}],
+                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "sd_method_EMAIL"}],
+                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
+                                    ]
+                                }
+                            )
+                            continue
+
+                        if self.awaiting_input == "SD_ACTIVE_FLOW" and LINK_SERVICE_URL:
+                            try:
+                                async with self.http_session.post(
+                                    f"{LINK_SERVICE_URL}/api/forward_input",
+                                    json={"kind": "TEXT", "text": text},
+                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ) as resp:
+                                    res_j = await resp.json()
+                                    if res_j.get("consumed") and "@" not in text and msg_id_user:
+                                        asyncio.create_task(self.tg_api(
+                                            "deleteMessage",
+                                            {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id_user},
+                                            req_timeout=10.0,
+                                            retries=1
+                                        ))
+                            except Exception:
+                                pass
                             continue
 
                         if self.awaiting_input == "SET_DEMO_AUTH":
@@ -3311,6 +3424,7 @@ class AboodControlBot:
             if not demo_s and not live_s:
                 return web.Response(text="Missing session", status=400)
 
+            self.awaiting_input = None
             acc = self.register_captured_account(name, uid, demo_s, live_s)
             self.full_reset_to_scanning("ربط حساب عبر SnapDeploy")
             log("WEBHOOK_AUTH", f"🌐 تم استلام وربط الحساب: {acc['name']} (UID: {acc['uid']})")
@@ -3318,7 +3432,7 @@ class AboodControlBot:
             safe_name = html.escape(acc["name"])
             live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
             asyncio.create_task(self.send_admin(
-                f"🌐 <b>تم ربط حساب جديد عبر بوابة SnapDeploy!</b>\n"
+                f"🌐 <b>تم ربط حساب جديد تلقائيًا عبر SnapDeploy!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>الاسم:</b> {safe_name}\n"
                 f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
