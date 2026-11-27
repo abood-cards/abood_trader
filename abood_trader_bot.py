@@ -21,7 +21,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تل�
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
 
-# رابط خدمة الربط المنفصلة على SnapDeploy ومفتاح الأمان المشترك
+# رابط خدمة الربط المنفصلة على Northflank ومفتاح الأمان المشترك
 LINK_SERVICE_URL = os.getenv("LINK_SERVICE_URL", "").rstrip("/")
 LINK_WEBHOOK_SECRET = os.getenv("LINK_WEBHOOK_SECRET", "abood_secure_link_2026")
 
@@ -236,9 +236,10 @@ class AboodControlBot:
         # الوضع السريع (Turbo Mode)
         self.fast_mode = False
 
-        # الشطرنج الشديد: يقبل الشموع الصغيرة ذات اللون الواضح ويستبعد الشموع المسطحة/الهامشية
+        # الشطرنج الشديد + الشمعة السادسة
         self.strict_chess_enabled = False
         self.strict_body_ratio = 0.25
+        self.sixth_candle_enabled = False
 
         # ميزة المزدوج + عدد الصفقات المتزامنة
         self.max_locked_pairs = 1
@@ -359,6 +360,7 @@ class AboodControlBot:
                 self.profit_limit = float(st.get("profit_limit", 50.0))
                 self.loss_limit = float(st.get("loss_limit", 50.0))
                 self.strict_chess_enabled = bool(st.get("strict_chess_enabled", False))
+                self.sixth_candle_enabled = bool(st.get("sixth_candle_enabled", False))
         except Exception as e:
             log("STATE_WARN", f"تعذر قراءة ملف الحالة: {e}")
 
@@ -373,6 +375,7 @@ class AboodControlBot:
                     "profit_limit": self.profit_limit,
                     "loss_limit": self.loss_limit,
                     "strict_chess_enabled": self.strict_chess_enabled,
+                    "sixth_candle_enabled": self.sixth_candle_enabled,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log("STATE_WARN", f"تعذر حفظ ملف الحالة: {e}")
@@ -404,9 +407,10 @@ class AboodControlBot:
                 ))
                 self.reset_boost_state(reset_peak=False)
 
-        return self.check_and_enforce_limits(float(new_bal))
+        # فحص حد الربح دائمًا، أما حد الخسارة فيُفحص فقط عند عدم وجود صفقات مفتوحة حاليًا
+        return self.check_and_enforce_limits(float(new_bal), allow_loss_check=(len(self.active_trades) == 0))
 
-    def check_and_enforce_limits(self, current_bal: float) -> bool:
+    def check_and_enforce_limits(self, current_bal: float, allow_loss_check: bool = True) -> bool:
         if not self.is_running or not self.limits_enabled:
             return False
 
@@ -417,13 +421,14 @@ class AboodControlBot:
         start_b = self.limit_start_balance
         diff = float(current_bal) - start_b
 
+        # 1) حد الربح: يتوقف فورًا في أي لحظة يبلغ فيها الرصيد الهدف ويلغي الصفقات المجهزة
         if self.profit_limit > 0 and diff >= (self.profit_limit - 1e-6):
             self.is_running = False
             self.full_reset_to_scanning("الوصول إلى حد الربح")
             self.limit_start_balance = None
             log("LIMIT_PROFIT", f"🎯 تم الوصول إلى حد الربح! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (+${format_money(diff)})")
             asyncio.create_task(self.send_admin(
-                f"🎯 <b>تم الوصول إلى حد الربح — تم إيقاف التداول والصفقات فورًا ✅</b>\n"
+                f"🎯 <b>تم الوصول إلى حد الربح — تم إيقاف التداول وإلغاء الصفقات المجهزة فورًا ✅</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 <b>رصيد بدء التداول:</b> <code>${format_money(start_b)}</code>\n"
                 f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
@@ -432,20 +437,22 @@ class AboodControlBot:
             ))
             return True
 
-        if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 1e-6):
-            self.is_running = False
-            self.full_reset_to_scanning("الوصول إلى حد الخسارة")
-            self.limit_start_balance = None
-            log("LIMIT_LOSS", f"🛑 تم الوصول إلى حد الخسارة! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (-${format_money(abs(diff))})")
-            asyncio.create_task(self.send_admin(
-                f"🛑 <b>تم الوصول إلى حد الخسارة — تم إيقاف التداول والصفقات فورًا ⚠️</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>رصيد بدء التداول:</b> <code>${format_money(start_b)}</code>\n"
-                f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
-                f"📉 <b>الخسارة المسجلة:</b> <code>-${format_money(abs(diff))}</code> (الحد: <code>${format_money(self.loss_limit)}</code>)",
-                self.build_main_keyboard()
-            ))
-            return True
+        # 2) حد الخسارة: ينتظر انتهاء الصفقة المفتوحة أولاً قبل إعلان بلوغ حد الخسارة
+        if allow_loss_check and not self.active_trades:
+            if self.loss_limit > 0 and (-diff) >= (self.loss_limit - 1e-6):
+                self.is_running = False
+                self.full_reset_to_scanning("الوصول إلى حد الخسارة")
+                self.limit_start_balance = None
+                log("LIMIT_LOSS", f"🛑 تم الوصول إلى حد الخسارة! البداية: ${format_money(start_b)} -> الحالي: ${format_money(current_bal)} (-${format_money(abs(diff))})")
+                asyncio.create_task(self.send_admin(
+                    f"🛑 <b>تم الوصول إلى حد الخسارة — تم إيقاف التداول والصفقات فورًا ⚠️</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 <b>رصيد بدء التداول:</b> <code>${format_money(start_b)}</code>\n"
+                    f"💵 <b>الرصيد الحالي:</b> <code>${format_money(current_bal)}</code>\n"
+                    f"📉 <b>الخسارة المسجلة:</b> <code>-${format_money(abs(diff))}</code> (الحد: <code>${format_money(self.loss_limit)}</code>)",
+                    self.build_main_keyboard()
+                ))
+                return True
 
         return False
 
@@ -463,7 +470,7 @@ class AboodControlBot:
 
         prev_mins = [m for m in sorted_mins if m < minutes_tuple[0]][-20:]
         if not prev_mins:
-            prev_mins = sorted_mins[:-5][-15:]
+            prev_mins = sorted_mins[:-len(minutes_tuple)][-15:]
 
         prev_bodies = [candle_body_size(pair_candles[m]) for m in prev_mins if candle_body_size(pair_candles[m]) > 0]
         if not prev_bodies:
@@ -1001,7 +1008,7 @@ class AboodControlBot:
         self.pending_martingale_steps.clear()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز + الشطرنج الشديد
+    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز + الشطرنج الشديد + الشمعة السادسة
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
@@ -1023,6 +1030,11 @@ class AboodControlBot:
             {"text": "⚔️ الشطرنج الشديد: مفعّل 🟢", "callback_data": "toggle_strict_chess"}
             if self.strict_chess_enabled
             else {"text": "⚔️ الشطرنج الشديد: متوقف 🔴", "callback_data": "toggle_strict_chess"}
+        )
+        sixth_btn = (
+            {"text": "🕯️ الشمعة السادسة: مفعّل 🟢", "callback_data": "toggle_sixth_candle"}
+            if self.sixth_candle_enabled
+            else {"text": "🕯️ الشمعة السادسة: متوقف 🔴", "callback_data": "toggle_sixth_candle"}
         )
         ind_master_btn = (
             {"text": "📊 المؤشرات: مفعّل 🟢", "callback_data": "toggle_indicators_master"}
@@ -1058,7 +1070,8 @@ class AboodControlBot:
                 [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
                 [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
                 [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
-                [strict_chess_btn, {"text": f"🔭 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
+                [strict_chess_btn, sixth_btn],
+                [{"text": f"🔭 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
                 [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
                 [
                     {"text": dual_label, "callback_data": "set_dual_pairs"},
@@ -1280,7 +1293,7 @@ class AboodControlBot:
 
         if LINK_SERVICE_URL:
             rows.append([{
-                "text": "🤖 ربط تلقائي (بريد / Google) عبر SnapDeploy",
+                "text": "🤖 ربط تلقائي (بريد / Google) عبر Northflank",
                 "callback_data": "sd_login_start"
             }])
 
@@ -1344,6 +1357,7 @@ class AboodControlBot:
         turnover_str = format_money(self.total_turnover)
 
         strict_str = "🟢 مفعّل (شموع واضحة اللون)" if self.strict_chess_enabled else "🔴 متوقف"
+        sixth_str = "🟢 مفعّل (تحليل 6 شموع)" if self.sixth_candle_enabled else "🔴 متوقف (5 شموع)"
 
         if self.limits_enabled:
             if self.limit_start_balance is not None:
@@ -1408,6 +1422,7 @@ class AboodControlBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>الحدود (ربح/خسارة):</b> {limits_status}\n"
             f"⚔️ <b>الشطرنج الشديد:</b> {strict_str}\n"
+            f"🕯️ <b>الشمعة السادسة:</b> {sixth_str}\n"
             f"🔭 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
             f"📊 <b>المؤشرات والفلاتر:</b> {self.get_active_indicators_summary()}\n"
             f"👯 <b>المزدوج / الصفقات:</b> يمسك <code>{self.max_locked_pairs}</code> عملات | يدخل <code>{self.max_concurrent_trades}</code> صفقات\n"
@@ -1502,7 +1517,7 @@ class AboodControlBot:
                 self.reset_daily_stats()
 
     # ==========================================
-    # حلقة استقبال أوامر وأزرار تليجرام + تمرير خطوات الربط إلى SnapDeploy
+    # حلقة استقبال أوامر وأزرار تليجرام + تمرير خطوات الربط إلى Northflank
     # ==========================================
     async def telegram_polling_loop(self):
         offset = 0
@@ -1545,11 +1560,11 @@ class AboodControlBot:
 
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
 
-                        # أزرار الربط التلقائي عبر SnapDeploy
+                        # أزرار الربط التلقائي عبر Northflank
                         if data == "sd_login_start":
                             self.awaiting_input = "SD_ACC_NAME"
                             await self.send_admin(
-                                "🤖 <b>ربط تلقائي عبر متصفح SnapDeploy السحابي</b>\n"
+                                "🤖 <b>ربط تلقائي عبر متصفح Northflank السحابي</b>\n"
                                 "━━━━━━━━━━━━━━━━━━━━\n"
                                 "1️⃣ أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>) أو اضغط تخطي:",
                                 {
@@ -1594,10 +1609,10 @@ class AboodControlBot:
                                 ) as resp:
                                     if resp.status != 200:
                                         self.awaiting_input = None
-                                        await self.send_admin("⚠️ تعذر تشغيل خدمة الربط على SnapDeploy. تأكد من تشغيل الخدمة هناك.")
+                                        await self.send_admin("⚠️ تعذر تشغيل خدمة الربط على Northflank. تأكد من تشغيل الخدمة وضبط LINK_SERVICE_URL.")
                             except Exception as e:
                                 self.awaiting_input = None
-                                await self.send_admin(f"⚠️ تعذر الاتصال بخدمة SnapDeploy: <code>{type(e).__name__}</code>")
+                                await self.send_admin(f"⚠️ تعذر الاتصال بخدمة Northflank: <code>{type(e).__name__}</code>")
                             continue
                         elif data in ("sd_cancel", "sd_shot"):
                             kind_str = "CANCEL" if data == "sd_cancel" else "SHOT"
@@ -1630,6 +1645,10 @@ class AboodControlBot:
                             self.strict_chess_enabled = not self.strict_chess_enabled
                             self._save_bot_state()
                             log("STRICT_CHESS", f"حالة الشطرنج الشديد: {'مفعّل 🟢' if self.strict_chess_enabled else 'متوقف 🔴'}")
+                        elif data == "toggle_sixth_candle":
+                            self.sixth_candle_enabled = not self.sixth_candle_enabled
+                            self._save_bot_state()
+                            log("SIXTH_CANDLE", f"حالة الشمعة السادسة: {'مفعّل 🟢 (6 شموع)' if self.sixth_candle_enabled else 'متوقف 🔴 (5 شموع)'}")
                         elif data == "toggle_limits_master":
                             self.limits_enabled = not self.limits_enabled
                             if self.limits_enabled and self.is_running:
@@ -2263,7 +2282,7 @@ class AboodControlBot:
                                         self.build_limits_keyboard()
                                     )
                                     if self.account_balance is not None:
-                                        self.check_and_enforce_limits(float(self.account_balance))
+                                        self.check_and_enforce_limits(float(self.account_balance), allow_loss_check=(len(self.active_trades) == 0))
                                 else:
                                     await self.send_admin("⚠️ أدخل رقمًا أكبر من أو يساوي 0:")
                             except ValueError:
@@ -2603,14 +2622,60 @@ class AboodControlBot:
         c_open = candle_color(pair_candles[m_open]["open"], pair_candles[m_open]["close"])
         return (m4, m3, m2, m1, m_open), (c4, c3, c2, c1, c_open)
 
+    def get_last_six(self, asset: str):
+        pair_candles = self.candles.get(asset, {})
+        sorted_minutes = sorted(pair_candles.keys())
+        if len(sorted_minutes) < 6:
+            return None
+
+        m5, m4, m3, m2, m1, m_open = sorted_minutes[-6:]
+        c5 = candle_color(pair_candles[m5]["open"], pair_candles[m5]["close"])
+        c4 = candle_color(pair_candles[m4]["open"], pair_candles[m4]["close"])
+        c3 = candle_color(pair_candles[m3]["open"], pair_candles[m3]["close"])
+        c2 = candle_color(pair_candles[m2]["open"], pair_candles[m2]["close"])
+        c1 = candle_color(pair_candles[m1]["open"], pair_candles[m1]["close"])
+        c_open = candle_color(pair_candles[m_open]["open"], pair_candles[m_open]["close"])
+        return (m5, m4, m3, m2, m1, m_open), (c5, c4, c3, c2, c1, c_open)
+
     def print_five_candles(self, asset: str, force: bool = False):
+        if self.sixth_candle_enabled:
+            data6 = self.get_last_six(asset)
+            if data6 is None:
+                return
+            (m5, m4, m3, m2, m1, m_open), (c5, c4, c3, c2, c1, c_open) = data6
+            payout = self.payouts.get(asset, 0)
+            state_signature = ("6C", m_open, c5, c4, c3, c2, c1, c_open, payout)
+            if not force and self.last_logged_state.get(asset) == state_signature:
+                return
+            self.last_logged_state[asset] = state_signature
+
+            shift = self.server_hour_shift
+            t5 = datetime.fromtimestamp(m5 - shift, tz=TZ_UTC3).strftime("%H:%M")
+            t4 = datetime.fromtimestamp(m4 - shift, tz=TZ_UTC3).strftime("%H:%M")
+            t3 = datetime.fromtimestamp(m3 - shift, tz=TZ_UTC3).strftime("%H:%M")
+            t2 = datetime.fromtimestamp(m2 - shift, tz=TZ_UTC3).strftime("%H:%M")
+            t1 = datetime.fromtimestamp(m1 - shift, tz=TZ_UTC3).strftime("%H:%M")
+            t_open = datetime.fromtimestamp(m_open - shift, tz=TZ_UTC3).strftime("%H:%M")
+
+            log(
+                "6-CANDLES",
+                f"{asset} ({payout}%) => "
+                f"[1({t5}): {color_label(c5)}] | "
+                f"[2({t4}): {color_label(c4)}] | "
+                f"[3({t3}): {color_label(c3)}] | "
+                f"[4({t2}): {color_label(c2)}] | "
+                f"[5({t1}): {color_label(c1)}] || "
+                f"[6-المفتوحة({t_open}): {color_label(c_open)}]"
+            )
+            return
+
         data = self.get_last_five(asset)
         if data is None:
             return
 
         (m4, m3, m2, m1, m_open), (c4, c3, c2, c1, c_open) = data
         payout = self.payouts.get(asset, 0)
-        state_signature = (m_open, c4, c3, c2, c1, c_open, payout)
+        state_signature = ("5C", m_open, c4, c3, c2, c1, c_open, payout)
         if not force and self.last_logged_state.get(asset) == state_signature:
             return
         self.last_logged_state[asset] = state_signature
@@ -2650,6 +2715,7 @@ class AboodControlBot:
         if not self.ws or not self.authenticated or not self.is_running:
             return
 
+        # فحص حد الربح وحد الخسارة قبل الدخول في أي صفقة
         if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
             return
 
@@ -2837,6 +2903,14 @@ class AboodControlBot:
                             self.global_step_index = 0
                         self.current_cycle_spent = 0.0
 
+                        # فحص حد الربح التقديري فور الفوز قبل فتح أي صفقة جديدة
+                        if self.limits_enabled and self.limit_start_balance is not None and self.account_balance is not None and self.profit_limit > 0:
+                            payout_pct = self.payouts.get(asset, self.min_payout) / 100.0
+                            est_balance_after_win = float(self.account_balance) + won_amount + (won_amount * payout_pct)
+                            if (est_balance_after_win - self.limit_start_balance) >= (self.profit_limit - 1e-6):
+                                if self.check_and_enforce_limits(est_balance_after_win):
+                                    break
+
                         if self.boost_enabled and self.in_boost_recovery and self.boost_mode == "TRADES":
                             self.boost_wins_done += 1
                             if self.boost_wins_done >= self.boost_target_wins:
@@ -2849,7 +2923,7 @@ class AboodControlBot:
                             else:
                                 log("BOOST_PROG", f"🛡️ تقدم التعزيز: تم إنجاز {self.boost_wins_done}/{self.boost_target_wins} صفقات ناجحة")
 
-                        if self.continuation_enabled and attempt_num == 1 and not is_cont:
+                        if self.continuation_enabled and attempt_num == 1 and not is_cont and self.is_running:
                             eligible, _ = self.is_pair_eligible(asset)
                             if eligible:
                                 opp_dir = "call" if direction == "put" else "put"
@@ -2884,6 +2958,10 @@ class AboodControlBot:
                         continue
 
                     # ج) حالة الخسارة (LOSS)
+                    # فحص حد الخسارة بعد انتهاء الصفقة وخسارتها
+                    if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+                        break
+
                     if not self.martingale_enabled:
                         self.record_trade_outcome(sig_sym, is_win=False, attempt_num=1)
                         loss_msg = (
@@ -2928,7 +3006,7 @@ class AboodControlBot:
 
                         self.current_cycle_spent = 0.0
                         self.global_step_index = 0
-                        if next_p_idx < self.pair_steps:
+                        if next_p_idx < self.pair_steps and self.is_running:
                             await self.open_trade(
                                 asset, direction,
                                 g_idx=0, p_idx=next_p_idx,
@@ -2937,7 +3015,7 @@ class AboodControlBot:
                                 cycle_base=None
                             )
                     else:
-                        if next_p_idx < self.pair_steps:
+                        if next_p_idx < self.pair_steps and self.is_running:
                             self.global_step_index = next_g_idx
                             await self.open_trade(
                                 asset, direction,
@@ -2959,6 +3037,10 @@ class AboodControlBot:
             # 2) فحص الأزواج المجهّزة في قائمة الانتظار
             # ========================================================
             if self.locked_candidates and self.is_running:
+                # التحقق الفوري من الحدود قبل فتح أي صفقة مجهزة
+                if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+                    continue
+
                 earliest_minute = min(c["target_minute"] for c in self.locked_candidates)
                 cand_remaining = (earliest_minute + 60.0 + SERVER_CLOCK_OFFSET) - server_now
 
@@ -3108,6 +3190,9 @@ class AboodControlBot:
         if not self.is_running:
             return
 
+        if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+            return
+
         locked_assets = {c["asset"] for c in self.locked_candidates}
         active_assets = {t["asset"] for t in self.active_trades}
         if asset not in self.get_active_scan_pairs() and asset not in locked_assets and asset not in active_assets:
@@ -3128,10 +3213,25 @@ class AboodControlBot:
             if asset in locked_assets or asset in active_assets:
                 return
 
-            data = self.get_last_five(asset)
-            if data is None:
-                return
-            (m4, m3, m2, m1, m_open), (c4, c3, c2, c1, c_open) = data
+            # تحديد النمط حسب تفعيل أو إيقاف «الشمعة السادسة»
+            if self.sixth_candle_enabled:
+                data6 = self.get_last_six(asset)
+                if data6 is None:
+                    return
+                (m5, m4, m3, m2, m1, m_open), (c5, c4, c3, c2, c1, c_open) = data6
+                minutes_seq = (m5, m4, m3, m2, m1, m_open)
+                is_put_pattern = (c5 == "GREEN" and c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED")
+                is_call_pattern = (c5 == "RED" and c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN")
+                candle_tag = " [6 شموع]"
+            else:
+                data5 = self.get_last_five(asset)
+                if data5 is None:
+                    return
+                (m4, m3, m2, m1, m_open), (c4, c3, c2, c1, c_open) = data5
+                minutes_seq = (m4, m3, m2, m1, m_open)
+                is_put_pattern = (c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED")
+                is_call_pattern = (c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN")
+                candle_tag = ""
 
             server_now = self.get_server_now()
             if (m_open + 60.0 + SERVER_CLOCK_OFFSET - server_now) <= (self.entry_lead_seconds + 0.5):
@@ -3143,8 +3243,8 @@ class AboodControlBot:
             rank = len(self.locked_candidates) + 1
             priority_line = f"┃ 🔢 الأولوية  <b>#{rank}</b>\n" if self.max_locked_pairs > 1 else ""
 
-            if c4 == "RED" and c3 == "RED" and c2 == "GREEN" and c1 == "RED":
-                strict_ok, strict_reason = self.check_strict_chess_candles(asset, (m4, m3, m2, m1, m_open))
+            if is_put_pattern:
+                strict_ok, strict_reason = self.check_strict_chess_candles(asset, minutes_seq)
                 if not strict_ok:
                     skip_sig = (m_open, "put", "STRICT", strict_reason)
                     if self.last_ind_skip_log.get(asset) != skip_sig:
@@ -3184,11 +3284,11 @@ class AboodControlBot:
                 asyncio.create_task(self.ensure_subscribed(asset))
                 log(
                     "LOCK",
-                    f"🎯 رصد نموذج بيع [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
+                    f"🎯 رصد نموذج بيع{candle_tag} [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
                 )
 
-            elif c4 == "GREEN" and c3 == "GREEN" and c2 == "RED" and c1 == "GREEN":
-                strict_ok, strict_reason = self.check_strict_chess_candles(asset, (m4, m3, m2, m1, m_open))
+            elif is_call_pattern:
+                strict_ok, strict_reason = self.check_strict_chess_candles(asset, minutes_seq)
                 if not strict_ok:
                     skip_sig = (m_open, "call", "STRICT", strict_reason)
                     if self.last_ind_skip_log.get(asset) != skip_sig:
@@ -3228,7 +3328,7 @@ class AboodControlBot:
                 asyncio.create_task(self.ensure_subscribed(asset))
                 log(
                     "LOCK",
-                    f"🎯 رصد نموذج شراء [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
+                    f"🎯 رصد نموذج شراء{candle_tag} [#{rank}/{self.max_locked_pairs}] على {sig_sym} ({payout}%) | الدخول: {entry_time_str} [UTC+3]"
                 )
 
     async def handle_payload(self, event_name: str, data):
@@ -3399,7 +3499,7 @@ class AboodControlBot:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
-    # خادم الويب المدمج ومستقبل الربط السحابي (SnapDeploy Webhook)
+    # خادم الويب المدمج ومستقبل الربط السحابي (Northflank Webhook)
     # ==========================================
     async def start_keepalive_web_server(self):
         async def health_handler(request):
@@ -3426,13 +3526,13 @@ class AboodControlBot:
 
             self.awaiting_input = None
             acc = self.register_captured_account(name, uid, demo_s, live_s)
-            self.full_reset_to_scanning("ربط حساب عبر SnapDeploy")
+            self.full_reset_to_scanning("ربط حساب عبر Northflank")
             log("WEBHOOK_AUTH", f"🌐 تم استلام وربط الحساب: {acc['name']} (UID: {acc['uid']})")
 
             safe_name = html.escape(acc["name"])
             live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
             asyncio.create_task(self.send_admin(
-                f"🌐 <b>تم ربط حساب جديد تلقائيًا عبر SnapDeploy!</b>\n"
+                f"🌐 <b>تم ربط حساب جديد تلقائيًا عبر Northflank!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>الاسم:</b> {safe_name}\n"
                 f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
