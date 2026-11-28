@@ -15,6 +15,7 @@ from aiohttp import web
 import joblib
 import lightgbm as lgb
 import numpy as np
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, VotingClassifier
 import websockets
 
 if sys.stdout.encoding != "utf-8":
@@ -26,6 +27,10 @@ if sys.stdout.encoding != "utf-8":
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
+
+# مفتاح Gemini API المجاني (اختياري — أضفه في Render ليعمل كمدقق ذكي مزدوج مجانًا)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 DEFAULT_LEAD_SECONDS = 0.1
 SERVER_CLOCK_OFFSET = 0.75
@@ -41,7 +46,7 @@ DEFAULT_LIVE_AUTH_FRAME = os.getenv("PO_LIVE_AUTH_FRAME", "")
 ACCOUNTS_FILE = "accounts.json"
 STATE_FILE = "bot_state.json"
 AI_DATASET_FILE = "ai_ticks_dataset.csv"
-AI_MODEL_FILE = "abood_lgbm_model.joblib"
+AI_MODEL_FILE = "abood_ensemble_model.joblib"
 
 FALLBACK_CURRENCIES = [
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
@@ -152,8 +157,18 @@ def build_auth_frame_with_mode(frame: str, is_demo: bool) -> str:
 
 
 # ==========================================
-# دوال حساب المؤشرات الفنية
+# دوال حساب المؤشرات الفنية والاتجاه
 # ==========================================
+def calc_ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = (v * k) + (ema * (1.0 - k))
+    return ema
+
+
 def calc_rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) < period + 1:
         return None
@@ -215,10 +230,21 @@ def calc_atr(candles_list: list[dict], period: int = 14) -> float | None:
 
 
 # ==========================================
-# محرك LightGBM + جامع بيانات التدريب المجاني
+# محرك الذكاء الاصطناعي الهجين المتطور (Ensemble ML + Trend Guard + Gemini AI)
 # ==========================================
-class LightGBMTickEngine:
-    def __init__(self, min_confidence: float = 0.78):
+class HybridEnsembleAIEngine:
+    """
+    يدمج 3 طبقات ذكاء اصطناعي:
+    1) حارس الاتجاه ومنع عكس الترند الصاروخي (Trend & Exhaustion Guard).
+    2) نموذج Ensemble ثلاثي (LightGBM + RandomForest + ExtraTrees) مُدرَّب على بيانات M1.
+    3) مدقق Gemini 2.5 Flash المجاني لتأكيد الإشارات عالية الثقة.
+    """
+    CSV_HEADERS = [
+        "abs_z", "rsi_live", "rsi_7", "velocity_ratio", "momentum_5",
+        "range_ratio", "ema_dist_atr", "wick_reject", "dir_num", "hour_utc", "label"
+    ]
+
+    def __init__(self, min_confidence: float = 0.82):
         self.min_confidence = min_confidence
         self.tick_windows: dict[str, deque] = {}
         self.pair_cooldown: dict[str, float] = {}
@@ -226,6 +252,9 @@ class LightGBMTickEngine:
         self.pending_samples: list[dict] = []
         self.model = None
         self.samples_count = 0
+        self.gemini_enabled = bool(GEMINI_API_KEY)
+        self.gemini_calls_today = 0
+        self.gemini_last_verdict = "غير نشط"
         self._init_dataset_file()
         self._load_trained_model()
 
@@ -233,17 +262,20 @@ class LightGBMTickEngine:
         if not os.path.exists(AI_DATASET_FILE):
             try:
                 with open(AI_DATASET_FILE, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        "abs_z", "rsi_live", "velocity_ratio", "momentum_5",
-                        "range_ratio", "dir_num", "hour_utc", "label"
-                    ])
+                    csv.writer(f).writerow(self.CSV_HEADERS)
             except Exception:
                 pass
         else:
             try:
                 with open(AI_DATASET_FILE, "r", encoding="utf-8") as f:
-                    self.samples_count = max(0, sum(1 for _ in f) - 1)
+                    first_line = f.readline().strip()
+                    if "ema_dist_atr" not in first_line:
+                        # ترقية ملف البيانات القديم تلقائيًا إلى الهيكل الجديد ذي الـ 10 ميزات
+                        with open(AI_DATASET_FILE, "w", newline="", encoding="utf-8") as fw:
+                            csv.writer(fw).writerow(self.CSV_HEADERS)
+                        self.samples_count = 0
+                    else:
+                        self.samples_count = max(0, sum(1 for _ in f))
             except Exception:
                 self.samples_count = 0
 
@@ -251,9 +283,9 @@ class LightGBMTickEngine:
         if os.path.exists(AI_MODEL_FILE):
             try:
                 self.model = joblib.load(AI_MODEL_FILE)
-                log("LGBM", f"تم تحميل نموذج LightGBM المدرب بنجاح ✅ (عينات التدريب: {self.samples_count})")
+                log("AI_ENSEMBLE", f"تم تحميل نموذج Ensemble الثلاثي بنجاح ✅ (عينات: {self.samples_count})")
             except Exception as e:
-                log("LGBM_WARN", f"تعذر تحميل النموذج: {e}")
+                log("AI_WARN", f"تعذر تحميل النموذج: {e}")
                 self.model = None
 
     def reset(self):
@@ -278,8 +310,7 @@ class LightGBMTickEngine:
         if resolved_rows:
             try:
                 with open(AI_DATASET_FILE, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerows(resolved_rows)
+                    csv.writer(f).writerows(resolved_rows)
                 self.samples_count += len(resolved_rows)
             except Exception:
                 pass
@@ -292,12 +323,17 @@ class LightGBMTickEngine:
             with open(AI_DATASET_FILE, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    if "ema_dist_atr" not in row or row["ema_dist_atr"] is None:
+                        continue
                     X.append([
                         float(row["abs_z"]),
                         float(row["rsi_live"]),
+                        float(row["rsi_7"]),
                         float(row["velocity_ratio"]),
                         float(row["momentum_5"]),
                         float(row["range_ratio"]),
+                        float(row["ema_dist_atr"]),
+                        float(row["wick_reject"]),
                         float(row["dir_num"]),
                         float(row["hour_utc"]),
                     ])
@@ -305,84 +341,141 @@ class LightGBMTickEngine:
         except Exception as e:
             return False, f"خطأ في قراءة البيانات: {e}"
 
-        if len(X) < 60:
-            return False, f"عدد العينات المسجلة حاليًا ({len(X)}) غير كافٍ للتدريب (المطلوب 60 عينة على الأقل)."
+        if len(X) < 80:
+            return False, f"عدد العينات المسجلة ({len(X)}) غير كافٍ للتدريب عالي الدقة (المطلوب 80 عينة على الأقل)."
 
         if len(set(y)) < 2:
-            return False, "العينات المسجلة تحتوي على فئة واحدة فقط حاليًا؛ انتظر جمع عينات متنوعة أكثر."
+            return False, "العينات المسجلة تحتوي على فئة واحدة فقط؛ انتظر جمع عينات متنوعة."
 
         X_arr = np.array(X, dtype=np.float32)
         y_arr = np.array(y, dtype=np.int32)
 
-        clf = lgb.LGBMClassifier(
-            n_estimators=80,
-            learning_rate=0.06,
-            num_leaves=15,
-            min_child_samples=10,
-            random_state=42,
-            verbose=-1
+        # دمج 3 خوارزميات قوية بالتصويت الموزون (Soft Voting Ensemble)
+        m_lgb = lgb.LGBMClassifier(
+            n_estimators=120, learning_rate=0.04, num_leaves=15,
+            subsample_for_bin=50, min_child_samples=8, random_state=42, verbose=-1
         )
-        clf.fit(X_arr, y_arr)
-        joblib.dump(clf, AI_MODEL_FILE)
-        self.model = clf
-        acc = float(np.mean(clf.predict(X_arr) == y_arr)) * 100.0
-        return True, f"تم تدريب نموذج LightGBM بنجاح على {len(X)} عينة! (دقة التدريب: {acc:.1f}%)"
+        m_rf = RandomForestClassifier(
+            n_estimators=120, max_depth=6, min_samples_leaf=5, random_state=42, n_jobs=-1
+        )
+        m_et = ExtraTreesClassifier(
+            n_estimators=120, max_depth=6, min_samples_leaf=5, random_state=42, n_jobs=-1
+        )
 
-    def evaluate_tick(self, asset: str, price: float, now_ts: float) -> tuple[str | None, float, bool]:
+        ensemble = VotingClassifier(
+            estimators=[("lgb", m_lgb), ("rf", m_rf), ("et", m_et)],
+            voting="soft",
+            weights=[2, 1, 1]
+        )
+        ensemble.fit(X_arr, y_arr)
+        joblib.dump(ensemble, AI_MODEL_FILE)
+        self.model = ensemble
+        acc = float(np.mean(ensemble.predict(X_arr) == y_arr)) * 100.0
+        return True, f"تم تدريب نموذج Ensemble الثلاثي (LightGBM + RF + ET) على {len(X)} عينة! (الدقة: {acc:.1f}%)"
+
+    def evaluate_tick(self, asset: str, price: float, now_ts: float, pair_candles: dict) -> tuple[str | None, float, str, dict]:
         if asset not in self.tick_windows:
-            self.tick_windows[asset] = deque(maxlen=120)
+            self.tick_windows[asset] = deque(maxlen=150)
 
         win = self.tick_windows[asset]
         win.append((now_ts, price))
 
-        if len(win) < 40:
-            return None, 0.0, False
+        if len(win) < 50:
+            return None, 0.0, "", {}
+
+        sorted_mins = sorted(pair_candles.keys())
+        if len(sorted_mins) < 22:
+            return None, 0.0, "", {}
+
+        ordered_c = [pair_candles[m] for m in sorted_mins[-30:]]
+        closes_c = [c["close"] for c in ordered_c]
+        ema20 = calc_ema(closes_c, 20)
+        atr14 = calc_atr(ordered_c, 14)
+        if ema20 is None or atr14 is None or atr14 <= 1e-9:
+            return None, 0.0, "", {}
+
+        # قياس بُعد السعر عن المتوسط العام EMA20 بوحدات ATR (لمنع الدخول ضد ترند منفجر)
+        ema_dist_atr = (price - ema20) / atr14
 
         prices = [p for _, p in win]
         times = [t for t, _ in win]
 
-        recent_p = prices[-35:]
+        recent_p = prices[-45:]
         mean_p = sum(recent_p) / len(recent_p)
         std_p = math.sqrt(sum((x - mean_p) ** 2 for x in recent_p) / len(recent_p))
         if std_p <= 1e-9:
-            return None, 0.0, False
+            return None, 0.0, "", {}
         z_score = (price - mean_p) / std_p
 
         ticks_5s = sum(1 for t in times if (now_ts - t) <= 5.0)
         ticks_30s = sum(1 for t in times if (now_ts - t) <= 30.0)
         velocity_ratio = (ticks_5s / 5.0) / max((ticks_30s / 30.0), 0.1)
 
-        deltas = [prices[i] - prices[i - 1] for i in range(-14, 0)]
-        gains = sum(d for d in deltas if d > 0) / 14.0
-        losses = sum(-d for d in deltas if d < 0) / 14.0
-        rsi_live = 100.0 if losses == 0 else 100.0 - (100.0 / (1.0 + (gains / losses)))
+        # RSI(14) و RSI(7) على التيكات الحية
+        d14 = [prices[i] - prices[i - 1] for i in range(-14, 0)]
+        g14 = sum(d for d in d14 if d > 0) / 14.0
+        l14 = sum(-d for d in d14 if d < 0) / 14.0
+        rsi_live = 100.0 if l14 == 0 else 100.0 - (100.0 / (1.0 + (g14 / l14)))
+
+        d7 = d14[-7:]
+        g7 = sum(d for d in d7 if d > 0) / 7.0
+        l7 = sum(-d for d in d7 if d < 0) / 7.0
+        rsi_7 = 100.0 if l7 == 0 else 100.0 - (100.0 / (1.0 + (g7 / l7)))
 
         momentum_5 = (price - prices[-6]) / std_p
-        range_35 = max(recent_p) - min(recent_p)
-        range_ratio = abs(price - mean_p) / max(range_35, 1e-9)
+        range_45 = max(recent_p) - min(recent_p)
+        range_ratio = abs(price - mean_p) / max(range_45, 1e-9)
 
-        p_prev1, p_prev2 = prices[-2], prices[-3]
-        if z_score >= 1.95 and rsi_live >= 71.0 and price < p_prev1 <= p_prev2:
+        # فحص الرفض السعري (Wick Rejection) في الشمعة الحالية
+        last_c = ordered_c[-1]
+        c_range = max(last_c["high"] - last_c["low"], 1e-9)
+        upper_wick_ratio = (last_c["high"] - max(last_c["open"], last_c["close"])) / c_range
+        lower_wick_ratio = (min(last_c["open"], last_c["close"]) - last_c["low"]) / c_range
+
+        p_prev1, p_prev2, p_prev3 = prices[-2], prices[-3], prices[-4]
+
+        # شروط أكثر صرامة: انحراف حاد + تشبع مزدوج + كسر 3 تيكات + وجود ذيل رفض سعري
+        if (
+            z_score >= 2.25
+            and rsi_live >= 74.0
+            and rsi_7 >= 78.0
+            and price < p_prev1 < p_prev2
+            and p_prev2 <= p_prev3
+            and ema_dist_atr <= 2.8  # لا تبع إذا كان السوق في ترند صاعد منفجر فوق 2.8 ATR
+        ):
             direction = "put"
-        elif z_score <= -1.95 and rsi_live <= 29.0 and price > p_prev1 >= p_prev2:
+            wick_reject = upper_wick_ratio
+        elif (
+            z_score <= -2.25
+            and rsi_live <= 26.0
+            and rsi_7 <= 22.0
+            and price > p_prev1 > p_prev2
+            and p_prev2 >= p_prev3
+            and ema_dist_atr >= -2.8  # لا تشترِ إذا كان السوق في انهيار حاد تحت -2.8 ATR
+        ):
             direction = "call"
+            wick_reject = lower_wick_ratio
         else:
-            return None, 0.0, False
+            return None, 0.0, "", {}
 
         dir_num = 1.0 if direction == "call" else -1.0
         hour_utc = float(datetime.fromtimestamp(now_ts, tz=timezone.utc).hour)
         feat_row = [
             round(abs(z_score), 4),
             round(rsi_live, 2),
+            round(rsi_7, 2),
             round(velocity_ratio, 3),
             round(momentum_5, 4),
             round(range_ratio, 4),
+            round(ema_dist_atr, 4),
+            round(wick_reject, 4),
             dir_num,
             hour_utc
         ]
 
-        if now_ts >= self.shadow_cooldown.get(asset, 0.0) and len(self.pending_samples) < 400:
-            self.shadow_cooldown[asset] = now_ts + 35.0
+        # تسجيل عينة صامتة في الخلفية كل 40 ثانية
+        if now_ts >= self.shadow_cooldown.get(asset, 0.0) and len(self.pending_samples) < 500:
+            self.shadow_cooldown[asset] = now_ts + 40.0
             self.pending_samples.append({
                 "asset": asset,
                 "dir": direction,
@@ -392,24 +485,38 @@ class LightGBMTickEngine:
             })
 
         if now_ts < self.pair_cooldown.get(asset, 0.0):
-            return None, 0.0, False
+            return None, 0.0, "", {}
 
-        used_lgbm = False
         if self.model is not None:
-            used_lgbm = True
+            engine_name = "Ensemble ML"
             X_in = np.array([feat_row], dtype=np.float32)
             confidence = float(self.model.predict_proba(X_in)[0][1])
         else:
-            z_norm = min(abs(z_score) / 3.0, 1.0)
-            rsi_ext = (rsi_live - 50.0) / 50.0 if direction == "put" else (50.0 - rsi_live) / 50.0
-            vel_norm = min(velocity_ratio / 2.3, 1.0)
-            confidence = (0.45 * z_norm) + (0.35 * rsi_ext) + (0.20 * vel_norm)
+            engine_name = "AI Guard"
+            z_norm = min(abs(z_score) / 3.2, 1.0)
+            rsi_ext = ((rsi_live - 50.0) / 50.0) if direction == "put" else ((50.0 - rsi_live) / 50.0)
+            wick_bonus = min(wick_reject * 1.5, 1.0)
+            vel_norm = min(velocity_ratio / 2.5, 1.0)
+            confidence = (0.35 * z_norm) + (0.30 * rsi_ext) + (0.20 * wick_bonus) + (0.15 * vel_norm)
+
+        meta = {
+            "z_score": round(z_score, 2),
+            "rsi_14": round(rsi_live, 1),
+            "rsi_7": round(rsi_7, 1),
+            "ema_dist_atr": round(ema_dist_atr, 2),
+            "wick_reject_pct": round(wick_reject * 100, 1),
+            "velocity": round(velocity_ratio, 2),
+            "last_3_candles": [
+                {"o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
+                for c in ordered_c[-3:]
+            ]
+        }
 
         if confidence >= self.min_confidence:
-            self.pair_cooldown[asset] = now_ts + 65.0
-            return direction, round(confidence, 3), used_lgbm
+            self.pair_cooldown[asset] = now_ts + 70.0
+            return direction, round(confidence, 3), engine_name, meta
 
-        return None, confidence, used_lgbm
+        return None, confidence, engine_name, meta
 
 
 class AboodControlBot:
@@ -424,8 +531,8 @@ class AboodControlBot:
 
         # الاستراتيجية النشطة: "CHESS" أو "INDICATORS" أو "AI"
         self.strategy_mode = "CHESS"
-        self.ai_min_confidence = 0.78
-        self.ai_scorer = LightGBMTickEngine(min_confidence=self.ai_min_confidence)
+        self.ai_min_confidence = 0.82
+        self.ai_scorer = HybridEnsembleAIEngine(min_confidence=self.ai_min_confidence)
         self.ind_strategy_cooldown = {}
 
         self.fast_mode = False
@@ -537,7 +644,7 @@ class AboodControlBot:
                 self.sixth_candle_enabled = bool(st.get("sixth_candle_enabled", False))
                 saved_strat = str(st.get("strategy_mode", "CHESS")).upper()
                 self.strategy_mode = saved_strat if saved_strat in ("CHESS", "INDICATORS", "AI") else "CHESS"
-                self.ai_min_confidence = float(st.get("ai_min_confidence", 0.78))
+                self.ai_min_confidence = float(st.get("ai_min_confidence", 0.82))
                 self.ai_scorer.min_confidence = self.ai_min_confidence
         except Exception as e:
             log("STATE_WARN", f"تعذر قراءة ملف الحالة: {e}")
@@ -824,6 +931,42 @@ class AboodControlBot:
         return f"🟢 مفعّل ({' + '.join(active) if active else 'RSI(28/72)'})"
 
     # ==========================================
+    # مدقق Gemini 2.5 Flash المجاني (اختياري عبر GEMINI_API_KEY)
+    # ==========================================
+    async def verify_with_gemini_free(self, asset: str, direction: str, meta: dict) -> tuple[bool, str]:
+        if not GEMINI_API_KEY or not self.http_session:
+            return True, "محلي"
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        prompt_txt = (
+            f"You are an ultra-fast M1 binary options scalping risk filter. "
+            f"Asset: {asset}, Proposed Direction: {direction.upper()} (60s expiry). "
+            f"Metrics: Z-Score={meta.get('z_score')}, RSI14={meta.get('rsi_14')}, RSI7={meta.get('rsi_7')}, "
+            f"EMA20_Dist_ATR={meta.get('ema_dist_atr')}, WickReject%={meta.get('wick_reject_pct')}, "
+            f"TickVelocity={meta.get('velocity')}, Last3Candles={json.dumps(meta.get('last_3_candles'))}. "
+            f"Reply ONLY with valid JSON: {{\"approve\": true/false, \"reason\": \"short 4 words\"}}."
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt_txt}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 60}
+        }
+        try:
+            async with self.http_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=1.8)) as resp:
+                if resp.status != 200:
+                    return True, "تجاوز سريع"
+                data = await resp.json()
+                raw_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                clean_json = raw_txt.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(clean_json)
+                approved = bool(parsed.get("approve", True))
+                reason = str(parsed.get("reason", "OK"))[:35]
+                self.ai_scorer.gemini_calls_today += 1
+                self.ai_scorer.gemini_last_verdict = f"{'✅' if approved else '❌'} {reason}"
+                return approved, reason
+        except Exception:
+            return True, "تجاوز مهلة"
+
+    # ==========================================
     # إدارة الحسابات
     # ==========================================
     def _normalize_account_record(self, acc: dict) -> dict:
@@ -1104,7 +1247,7 @@ class AboodControlBot:
         strat_labels = {
             "CHESS": "♟ الاستراتيجية: الشطرنج (اضغط للتبديل) 🔄",
             "INDICATORS": "📊 الاستراتيجية: المؤشرات المستقلة 🔄",
-            "AI": "🧠 الاستراتيجية: الذكاء الاصطناعي AI (LightGBM) 🔄"
+            "AI": "🧠 الاستراتيجية: الذكاء الهجين AI (Ensemble+Gemini) 🔄"
         }
         strategy_btn = {"text": strat_labels[self.strategy_mode], "callback_data": "cycle_strategy_mode"}
         mode_btn = {"text": "🧪 الحساب: تجريبي (Demo)", "callback_data": "toggle_account_mode"} if self.is_demo_mode else {"text": "💵 الحساب: حقيقي (Live) 🔥", "callback_data": "toggle_account_mode"}
@@ -1131,7 +1274,7 @@ class AboodControlBot:
         elif self.strategy_mode == "AI":
             rows.append([
                 {"text": f"🎚 ثقة AI ({int(self.ai_min_confidence * 100)}%)", "callback_data": "set_ai_conf"},
-                {"text": "🧠 مركز تدريب LightGBM", "callback_data": "menu_ai_train"}
+                {"text": "🧠 مركز الذكاء والتصدير", "callback_data": "menu_ai_train"}
             ])
 
         rows.extend([
@@ -1149,21 +1292,24 @@ class AboodControlBot:
         return {"inline_keyboard": rows}
 
     def format_ai_menu_text(self) -> str:
-        model_st = "🟢 <b>مُدرَّب ونشط (LightGBM Model)</b>" if self.ai_scorer.model is not None else "🟡 <b>طور جمع البيانات (يعمل بالمعادلة الذكية مؤقتًا)</b>"
+        model_st = "🟢 <b>مُدرَّب ونشط (Ensemble: LightGBM + RF + ET)</b>" if self.ai_scorer.model is not None else "🟡 <b>طور جمع البيانات (يعمل بحارس الاتجاه AI Guard)</b>"
+        gem_st = f"🟢 <b>مفعّل ({GEMINI_MODEL})</b> | فحوصات اليوم: <code>{self.ai_scorer.gemini_calls_today}</code>" if GEMINI_API_KEY else "⚪ <b>اختياري</b> (أضف <code>GEMINI_API_KEY</code> في Render لتفعيل التدقيق المزدوج مجانًا)"
         return (
-            f"🧠 <b>مركز الذكاء الاصطناعي المجاني (LightGBM)</b>\n"
+            f"🧠 <b>مركز الذكاء الاصطناعي الهجين (Ensemble + Gemini)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚙️ <b>حالة النموذج:</b> {model_st}\n"
-            f"📊 <b>العينات المجمعة من السوق:</b> <code>{self.ai_scorer.samples_count} عينة</code>\n"
+            f"⚙️ <b>النموذج المحلي:</b> {model_st}\n"
+            f"✨ <b>مدقق Gemini المجاني:</b> {gem_st}\n"
+            f"📊 <b>العينات المجمعة (10 ميزات):</b> <code>{self.ai_scorer.samples_count} عينة</code>\n"
             f"🎚 <b>عتبة الثقة المطلوبة للدخول:</b> <code>{int(self.ai_min_confidence * 100)}%</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>يجمع البوت عينات السوق تلقائيًا في الخلفية مجانًا؛ وعند بلوغ 60 عينة فأكثر اضغط «تدريب نموذج LightGBM الآن».</i>"
+            f"<i>يجمع البوت عينات السوق تلقائيًا (مع حارس الاتجاه EMA20/ATR لمنع عكس الترند)؛ وعند بلوغ 80 عينة فأكثر اضغط «تدريب النموذج» ثم اسحب الملفات لحفظها.</i>"
         )
 
     def build_ai_menu_keyboard(self) -> dict:
         return {
             "inline_keyboard": [
-                [{"text": "🚀 تدريب نموذج LightGBM الآن (مجانًا)", "callback_data": "ai_run_train"}],
+                [{"text": "🚀 تدريب نموذج Ensemble الثلاثي الآن (مجانًا)", "callback_data": "ai_run_train"}],
+                [{"text": "📥 سحب ملفات AI (العينات + النموذج) للتحميل", "callback_data": "ai_export_files"}],
                 [{"text": f"🎚 ضبط نسبة الثقة ({int(self.ai_min_confidence * 100)}%)", "callback_data": "set_ai_conf"}],
                 [{"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "cmd_status"}]
             ]
@@ -1286,8 +1432,9 @@ class AboodControlBot:
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
 
         if self.strategy_mode == "AI":
-            lgbm_tag = "LightGBM مُدرَّب ✅" if self.ai_scorer.model is not None else f"جامع بيانات ({self.ai_scorer.samples_count} عينة)"
-            strat_line = f"🧠 <b>الاستراتيجية:</b> <b>الذكاء الاصطناعي AI</b> ({lgbm_tag} | ثقة ≥ <code>{int(self.ai_min_confidence * 100)}%</code>)"
+            ens_tag = "Ensemble مُدرَّب ✅" if self.ai_scorer.model is not None else f"جامع بيانات ({self.ai_scorer.samples_count} عينة)"
+            gem_tag = " + Gemini✅" if GEMINI_API_KEY else ""
+            strat_line = f"🧠 <b>الاستراتيجية:</b> <b>الذكاء الهجين AI</b> ({ens_tag}{gem_tag} | ثقة ≥ <code>{int(self.ai_min_confidence * 100)}%</code>)"
             sub_strat_line = f"📡 <b>الأزواج المراقبة لحظيًا:</b> <code>{len(self.subscribed_pairs)}</code> عملة متصلة"
         elif self.strategy_mode == "INDICATORS":
             strat_line = "📊 <b>الاستراتيجية:</b> <b>المؤشرات المستقلة (دخول فوري بدون شطرنج)</b>"
@@ -1329,7 +1476,7 @@ class AboodControlBot:
         )
 
     # ==========================================
-    # الاتصال بتليجرام والقناة
+    # الاتصال بتليجرام والقناة وإرسال الملفات
     # ==========================================
     async def tg_api(self, method: str, payload: dict, req_timeout: float = 15.0, retries: int = 3):
         if not self.http_session:
@@ -1352,6 +1499,25 @@ class AboodControlBot:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         await self.tg_api("sendMessage", payload)
+
+    async def send_admin_document(self, file_path: str, caption: str = "") -> bool:
+        if not self.http_session or not os.path.exists(file_path):
+            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(ADMIN_CHAT_ID))
+        if caption:
+            form.add_field("caption", caption)
+            form.add_field("parse_mode", "HTML")
+        with open(file_path, "rb") as f:
+            form.add_field("document", f.read(), filename=os.path.basename(file_path))
+        try:
+            async with self.http_session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                res = await resp.json()
+                return bool(res and res.get("ok"))
+        except Exception as e:
+            log("TG_DOC_ERR", f"فشل إرسال الملف {file_path}: {e}")
+            return False
 
     async def send_channel(self, text: str, reply_to_message_id: int = None) -> int | None:
         if not CHANNEL_ID or "ضع_" in str(CHANNEL_ID):
@@ -1420,6 +1586,25 @@ class AboodControlBot:
                             await self.tg_api("editMessageText", {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id, "text": self.format_ai_menu_text(), "parse_mode": "HTML", "reply_markup": self.build_ai_menu_keyboard()})
                             continue
 
+                        if data == "ai_export_files":
+                            asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "⏳ جاري سحب وإرسال ملفات AI..."}, retries=1))
+                            sent_any = False
+                            if os.path.exists(AI_DATASET_FILE):
+                                ok1 = await self.send_admin_document(
+                                    AI_DATASET_FILE,
+                                    f"📊 <b>ملف عينات التدريب</b> ({self.ai_scorer.samples_count} عينة)"
+                                )
+                                sent_any = sent_any or ok1
+                            if os.path.exists(AI_MODEL_FILE):
+                                ok2 = await self.send_admin_document(
+                                    AI_MODEL_FILE,
+                                    "🧠 <b>نموذج Ensemble الثلاثي المُدرَّب</b> (ارفعه لمستودع GitHub ليحمله البوت تلقائيًا)"
+                                )
+                                sent_any = sent_any or ok2
+                            if not sent_any:
+                                await self.send_admin("⚠️ لا توجد ملفات بيانات أو نموذج محفوظة حتى الآن.")
+                            continue
+
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, retries=1))
 
                         if data == "cycle_strategy_mode":
@@ -1434,7 +1619,7 @@ class AboodControlBot:
                             continue
                         elif data == "set_ai_conf":
                             self.awaiting_input = "AI_CONFIDENCE"
-                            await self.send_admin("🧠 أرسل نسبة ثقة الذكاء الاصطناعي المطلوبة (من <code>60</code> إلى <code>95</code>):")
+                            await self.send_admin("🧠 أرسل نسبة ثقة الذكاء الاصطناعي المطلوبة (من <code>65</code> إلى <code>95</code>؛ الموصى به <code>82</code>):")
                             continue
                         elif data == "cmd_start":
                             self.is_running = True
@@ -1702,7 +1887,7 @@ class AboodControlBot:
                         if self.awaiting_input == "AI_CONFIDENCE":
                             try:
                                 v = float(text.replace("%", ""))
-                                if 60 <= v <= 95:
+                                if 65 <= v <= 95:
                                     self.ai_min_confidence = v / 100.0
                                     self.ai_scorer.min_confidence = self.ai_min_confidence
                                     self._save_bot_state()
@@ -2144,7 +2329,9 @@ class AboodControlBot:
         if asset not in self.get_active_scan_pairs() or not self.is_pair_eligible(asset)[0]:
             return
 
-        ai_dir, ai_conf, used_lgbm = self.ai_scorer.evaluate_tick(asset, price, now_ts)
+        pair_candles = self.candles.get(asset, {})
+        ai_dir, ai_conf, engine_lbl, meta = self.ai_scorer.evaluate_tick(asset, price, now_ts, pair_candles)
+
         if not self.is_running:
             return
         if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
@@ -2153,9 +2340,16 @@ class AboodControlBot:
             return
 
         if self.strategy_mode == "AI" and ai_dir is not None:
+            # تدقيق إضافي عبر Gemini 2.5 Flash المجاني إذا كان المفتاح مضافًا
+            if GEMINI_API_KEY:
+                gem_ok, gem_reason = await self.verify_with_gemini_free(asset, ai_dir, meta)
+                if not gem_ok:
+                    log("GEMINI_SKIP", f"✨ رفض Gemini فرصة {asset} ({ai_dir}): {gem_reason}")
+                    return
+                engine_lbl = f"{engine_lbl} + Gemini"
+
             st, cb = (self.pending_martingale_steps.pop(0) if (self.martingale_enabled and self.pending_martingale_steps) else ((self.global_step_index, None) if (self.martingale_enabled and not any(t["g_idx"] > 0 for t in self.active_trades)) else (0, None)))
-            lbl = "LightGBM" if used_lgbm else "AI Scorer"
-            await self.open_trade(asset, ai_dir, st, 0, (int(now_ts) // 60) * 60, None, cycle_base=cb, custom_signal_header=f"🧠 <b>قنص فوري ({lbl})</b> | ثقة: <b>{int(ai_conf * 100)}%</b>")
+            await self.open_trade(asset, ai_dir, st, 0, (int(now_ts) // 60) * 60, None, cycle_base=cb, custom_signal_header=f"🧠 <b>قنص هجين ({engine_lbl})</b> | ثقة: <b>{int(ai_conf * 100)}%</b>")
             return
 
         if self.strategy_mode == "INDICATORS" and now_ts >= self.ind_strategy_cooldown.get(asset, 0.0):
