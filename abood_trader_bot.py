@@ -1,7 +1,9 @@
 import asyncio
+from collections import deque
 import html
 import inspect
 import json
+import math
 import os
 import statistics
 import sys
@@ -20,10 +22,6 @@ if sys.stdout.encoding != "utf-8":
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_بوت_تليجرام_هنا")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "ضع_رقم_الآيدي_الخاص_بك_هنا")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "ضع_اي_دي_القناة_هنا")
-
-# رابط خدمة الربط المنفصلة على Northflank ومفتاح الأمان المشترك
-LINK_SERVICE_URL = os.getenv("LINK_SERVICE_URL", "").rstrip("/")
-LINK_WEBHOOK_SECRET = os.getenv("LINK_WEBHOOK_SECRET", "abood_secure_link_2026")
 
 # المتغير الثابت للفحص والدخول قبل إغلاق الشمعة/الصفقة بأجزاء الثانية (0.1 = 100 مللي ثانية)
 DEFAULT_LEAD_SECONDS = 0.1
@@ -222,6 +220,77 @@ def calc_atr(candles_list: list[dict], period: int = 14) -> float | None:
     return sum(trs) / period
 
 
+# ==========================================
+# محرك الذكاء الاصطناعي اللحظي (Tick-Driven AI Sniper)
+# ==========================================
+class RealTimeTickAIScorer:
+    def __init__(self, min_confidence: float = 0.80):
+        self.min_confidence = min_confidence
+        self.tick_windows: dict[str, deque] = {}
+        self.pair_cooldown: dict[str, float] = {}
+
+    def reset(self):
+        self.tick_windows.clear()
+        self.pair_cooldown.clear()
+
+    def evaluate_tick(self, asset: str, price: float, now_ts: float) -> tuple[str | None, float]:
+        if asset not in self.tick_windows:
+            self.tick_windows[asset] = deque(maxlen=120)
+
+        win = self.tick_windows[asset]
+        win.append((now_ts, price))
+
+        if len(win) < 40:
+            return None, 0.0
+
+        if now_ts < self.pair_cooldown.get(asset, 0.0):
+            return None, 0.0
+
+        prices = [p for _, p in win]
+        times = [t for t, _ in win]
+
+        # 1. الانحراف السعري اللحظي (Z-Score) لآخر 35 تيك
+        recent_p = prices[-35:]
+        mean_p = sum(recent_p) / len(recent_p)
+        std_p = math.sqrt(sum((x - mean_p) ** 2 for x in recent_p) / len(recent_p))
+        if std_p <= 1e-9:
+            return None, 0.0
+        z_score = (price - mean_p) / std_p
+
+        # 2. سرعة تدفق السيولة (Tick Velocity) في آخر 5 ثوانٍ مقارنة بـ 30 ثانية
+        ticks_5s = sum(1 for t in times if (now_ts - t) <= 5.0)
+        ticks_30s = sum(1 for t in times if (now_ts - t) <= 30.0)
+        velocity_ratio = (ticks_5s / 5.0) / max((ticks_30s / 30.0), 0.1)
+
+        # 3. مؤشر RSI اللحظي السريع على آخر 14 حركة
+        deltas = [prices[i] - prices[i - 1] for i in range(-14, 0)]
+        gains = sum(d for d in deltas if d > 0) / 14.0
+        losses = sum(-d for d in deltas if d < 0) / 14.0
+        rsi_live = 100.0 if losses == 0 else 100.0 - (100.0 / (1.0 + (gains / losses)))
+
+        # 4. كشف نقطة الانعكاس اللحظي بعد الذروة
+        p_prev1, p_prev2 = prices[-2], prices[-3]
+
+        if z_score >= 2.05 and rsi_live >= 73.0 and price < p_prev1 <= p_prev2:
+            direction = "put"
+        elif z_score <= -2.05 and rsi_live <= 27.0 and price > p_prev1 >= p_prev2:
+            direction = "call"
+        else:
+            return None, 0.0
+
+        # 5. حساب درجة الثقة المركبة للذكاء الاصطناعي
+        z_score_norm = min(abs(z_score) / 3.1, 1.0)
+        rsi_extreme = (rsi_live - 50.0) / 50.0 if direction == "put" else (50.0 - rsi_live) / 50.0
+        vel_norm = min(velocity_ratio / 2.4, 1.0)
+        confidence = (0.45 * z_score_norm) + (0.35 * rsi_extreme) + (0.20 * vel_norm)
+
+        if confidence >= self.min_confidence:
+            self.pair_cooldown[asset] = now_ts + 65.0
+            return direction, round(confidence, 3)
+
+        return None, confidence
+
+
 class AboodControlBot:
     def __init__(self):
         # الإعدادات الأساسية القابلة للتحكم من تليجرام
@@ -232,6 +301,11 @@ class AboodControlBot:
         self.pair_steps = 4
         self.min_payout = 90
         self.entry_lead_seconds = DEFAULT_LEAD_SECONDS
+
+        # وضع الاستراتيجية: "CHESS" (الشطرنج الاعتيادي) أو "AI" (القنص اللحظي بالذكاء الاصطناعي)
+        self.strategy_mode = "CHESS"
+        self.ai_min_confidence = 0.80
+        self.ai_scorer = RealTimeTickAIScorer(min_confidence=self.ai_min_confidence)
 
         # الوضع السريع (Turbo Mode)
         self.fast_mode = False
@@ -281,7 +355,7 @@ class AboodControlBot:
         self._load_accounts_storage()
 
         # ==========================================
-        # نظام التعزيز الذكي (يعتمد على الرصيد الفعلي وقمته دون أي تهبيش)
+        # نظام التعزيز الذكي (يعتمد على الرصيد الفعلي وقمته)
         # ==========================================
         self.boost_enabled = False
         self.boost_mode = "CAPITAL"
@@ -361,6 +435,10 @@ class AboodControlBot:
                 self.loss_limit = float(st.get("loss_limit", 50.0))
                 self.strict_chess_enabled = bool(st.get("strict_chess_enabled", False))
                 self.sixth_candle_enabled = bool(st.get("sixth_candle_enabled", False))
+                saved_strat = str(st.get("strategy_mode", "CHESS")).upper()
+                self.strategy_mode = saved_strat if saved_strat in ("CHESS", "AI") else "CHESS"
+                self.ai_min_confidence = float(st.get("ai_min_confidence", 0.80))
+                self.ai_scorer.min_confidence = self.ai_min_confidence
         except Exception as e:
             log("STATE_WARN", f"تعذر قراءة ملف الحالة: {e}")
 
@@ -376,6 +454,8 @@ class AboodControlBot:
                     "loss_limit": self.loss_limit,
                     "strict_chess_enabled": self.strict_chess_enabled,
                     "sixth_candle_enabled": self.sixth_candle_enabled,
+                    "strategy_mode": self.strategy_mode,
+                    "ai_min_confidence": self.ai_min_confidence,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log("STATE_WARN", f"تعذر حفظ ملف الحالة: {e}")
@@ -592,7 +672,7 @@ class AboodControlBot:
 
     def get_active_indicators_summary(self) -> str:
         if not self.indicators_enabled:
-            return "🔴 متوقف (الاعتماد على الشطرنج فقط)"
+            return "🔴 متوقف (الاعتماد على الاستراتيجية فقط)"
         active_list = []
         if self.ind_bb_enabled:
             active_list.append(f"BB({int(self.ind_bb_zone * 100)}%)")
@@ -993,6 +1073,15 @@ class AboodControlBot:
             except Exception:
                 pass
 
+    async def subscribe_all_eligible_for_ai(self):
+        if not self.ws or not self.authenticated:
+            return
+        for pair in self.get_active_scan_pairs():
+            eligible, _ = self.is_pair_eligible(pair)
+            if eligible and pair not in self.subscribed_pairs:
+                await self.ensure_subscribed(pair)
+                await asyncio.sleep(0.02)
+
     def switch_pair_keep_global(self, reason: str):
         log("MODE", f"تغيير الزوج مع استمرار التدبيل العام ({self.global_step_index + 1}/{self.global_steps}) — {reason}")
         self.mode = "SCANNING"
@@ -1006,15 +1095,21 @@ class AboodControlBot:
         self.active_trades.clear()
         self.global_step_index = 0
         self.pending_martingale_steps.clear()
+        self.ai_scorer.reset()
 
     # ==========================================
-    # واجهة التحكم (خاص بالأدمن) + الحدود + المؤشرات + التعزيز + الشطرنج الشديد + الشمعة السادسة
+    # واجهة التحكم (خاص بالأدمن) + زر التبديل بين الشطرنج والذكاء الاصطناعي (AI)
     # ==========================================
     def build_main_keyboard(self) -> dict:
         toggle_btn = (
             {"text": "⏹ إيقاف التداول", "callback_data": "cmd_stop"}
             if self.is_running
             else {"text": "▶️ بدء التداول", "callback_data": "cmd_start"}
+        )
+        strategy_btn = (
+            {"text": "♟ النظام: الشطرنج (إغلاق الشموع)", "callback_data": "toggle_strategy_mode"}
+            if self.strategy_mode == "CHESS"
+            else {"text": "🧠 النظام: الذكاء الاصطناعي AI (قنص لحظي) ⚡", "callback_data": "toggle_strategy_mode"}
         )
         mode_btn = (
             {"text": "🧪 الحساب: تجريبي (Demo)", "callback_data": "toggle_account_mode"}
@@ -1065,47 +1160,55 @@ class AboodControlBot:
         dual_label = f"👯 المزدوج ({self.max_locked_pairs} عملات)" if self.max_locked_pairs > 1 else "👯 المزدوج (1 عملة)"
         trades_label = f"🎯 الصفقات ({self.max_concurrent_trades} من {self.max_locked_pairs})"
 
-        return {
-            "inline_keyboard": [
-                [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
-                [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
-                [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
-                [strict_chess_btn, sixth_btn],
-                [{"text": f"🔭 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
-                [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
-                [
-                    {"text": dual_label, "callback_data": "set_dual_pairs"},
-                    {"text": trades_label, "callback_data": "set_concurrent_trades"}
-                ],
-                [
-                    fast_btn,
-                    cont_btn
-                ],
-                [
-                    {"text": f"💵 الأساسي (${self.base_amount:g})", "callback_data": "set_amount"},
-                    {"text": f"📈 العائد (≥ {self.min_payout}%)", "callback_data": "set_payout"}
-                ],
-                [
-                    mtg_toggle_btn,
-                    {"text": f"🌐 التدبيل العام ({self.global_steps})", "callback_data": "set_global_steps"}
-                ],
-                [
-                    {"text": f"🏛 تدبيل الزوج ({self.pair_steps})", "callback_data": "set_pair_steps"},
-                    {"text": f"⏱ التقديم ({self.entry_lead_seconds}ث)", "callback_data": "set_lead"}
-                ],
-                [
-                    boost_btn,
-                    {"text": "⚙️ ضبط التعزيز", "callback_data": "menu_boost"}
-                ],
-                [
-                    {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"},
-                    {"text": "📢 نشر بالقناة", "callback_data": "stats_publish"}
-                ],
-                [
-                    {"text": "🗑️ تصفير الإحصائيات", "callback_data": "stats_reset"}
-                ]
+        rows = [
+            [toggle_btn, {"text": "📡 تحديث الحالة", "callback_data": "cmd_status"}],
+            [strategy_btn],
+            [mode_btn, {"text": "👤 إدارة الحسابات", "callback_data": "menu_accounts"}],
+            [limits_btn, {"text": "⚙️ ضبط الحدود", "callback_data": "menu_limits"}],
+        ]
+
+        if self.strategy_mode == "CHESS":
+            rows.append([strict_chess_btn, sixth_btn])
+        else:
+            rows.append([{"text": f"🎚 حساسية ثقة AI ({int(self.ai_min_confidence * 100)}%)", "callback_data": "set_ai_conf"}])
+
+        rows.extend([
+            [{"text": f"🔭 المسح: {self.get_scope_label()}", "callback_data": "menu_scope"}],
+            [ind_master_btn, {"text": "⚙️ ضبط المؤشرات", "callback_data": "menu_indicators"}],
+            [
+                {"text": dual_label, "callback_data": "set_dual_pairs"},
+                {"text": trades_label, "callback_data": "set_concurrent_trades"}
+            ],
+            [
+                fast_btn,
+                cont_btn
+            ],
+            [
+                {"text": f"💵 الأساسي (${self.base_amount:g})", "callback_data": "set_amount"},
+                {"text": f"📈 العائد (≥ {self.min_payout}%)", "callback_data": "set_payout"}
+            ],
+            [
+                mtg_toggle_btn,
+                {"text": f"🌐 التدبيل العام ({self.global_steps})", "callback_data": "set_global_steps"}
+            ],
+            [
+                {"text": f"🏛 تدبيل الزوج ({self.pair_steps})", "callback_data": "set_pair_steps"},
+                {"text": f"⏱ التقديم ({self.entry_lead_seconds}ث)", "callback_data": "set_lead"}
+            ],
+            [
+                boost_btn,
+                {"text": "⚙️ ضبط التعزيز", "callback_data": "menu_boost"}
+            ],
+            [
+                {"text": "📊 معاينة الإحصائيات", "callback_data": "stats_preview"},
+                {"text": "📢 نشر بالقناة", "callback_data": "stats_publish"}
+            ],
+            [
+                {"text": "🗑️ تصفير الإحصائيات", "callback_data": "stats_reset"}
             ]
-        }
+        ])
+
+        return {"inline_keyboard": rows}
 
     def build_limits_keyboard(self) -> dict:
         en_btn = (
@@ -1263,7 +1366,7 @@ class AboodControlBot:
         }
 
     def format_indicators_menu_text(self) -> str:
-        master_str = "🟢 <b>مفعّل</b> (يتم دمج المؤشرات مع الشطرنج)" if self.indicators_enabled else "🔴 <b>متوقف</b> (الاعتماد على الشطرنج فقط)"
+        master_str = "🟢 <b>مفعّل</b> (يتم دمج المؤشرات مع الاستراتيجية)" if self.indicators_enabled else "🔴 <b>متوقف</b> (الاعتماد على الاستراتيجية فقط)"
         return (
             f"📊 <b>إعدادات المؤشرات والفلاتر المساعدة</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1289,12 +1392,6 @@ class AboodControlBot:
             rows.append([{
                 "text": f"{prefix}{acc['name']} ({acc['uid']}) [Demo✅|{live_tag}]",
                 "callback_data": f"select_acc_{idx}"
-            }])
-
-        if LINK_SERVICE_URL:
-            rows.append([{
-                "text": "🤖 ربط تلقائي (بريد / Google) عبر Northflank",
-                "callback_data": "sd_login_start"
             }])
 
         rows.append([
@@ -1356,8 +1453,14 @@ class AboodControlBot:
         rate_today = (wins_today / total_today * 100.0) if total_today > 0 else 0.0
         turnover_str = format_money(self.total_turnover)
 
-        strict_str = "🟢 مفعّل (شموع واضحة اللون)" if self.strict_chess_enabled else "🔴 متوقف"
-        sixth_str = "🟢 مفعّل (تحليل 6 شموع)" if self.sixth_candle_enabled else "🔴 متوقف (5 شموع)"
+        if self.strategy_mode == "AI":
+            strat_line = f"🧠 <b>الاستراتيجية:</b> <b>الذكاء الاصطناعي AI (قنص لحظي لجميع العملات) ⚡</b> (ثقة ≥ <code>{int(self.ai_min_confidence * 100)}%</code>)"
+            sub_strat_line = f"📡 <b>الأزواج المراقبة لحظيًا:</b> <code>{len(self.subscribed_pairs)}</code> عملة متصلة"
+        else:
+            strict_str = "🟢 مفعّل" if self.strict_chess_enabled else "🔴 متوقف"
+            sixth_str = "🟢 6 شموع" if self.sixth_candle_enabled else "🔴 5 شموع"
+            strat_line = "♟ <b>الاستراتيجية:</b> <b>الشطرنج الاعتيادي (إغلاق الشموع)</b>"
+            sub_strat_line = f"⚔️ <b>الشطرنج الشديد:</b> {strict_str} | 🕯️ <b>الشمعة السادسة:</b> {sixth_str}"
 
         if self.limits_enabled:
             if self.limit_start_balance is not None:
@@ -1412,6 +1515,8 @@ class AboodControlBot:
             f"♟ <b>لوحة إدارة عبود تريدينج (24/7)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ <b>الحالة:</b> {status_icon}\n"
+            f"{strat_line}\n"
+            f"{sub_strat_line}\n"
             f"👤 <b>الحساب النشط:</b> <b>{safe_acc_name}</b> (<code>{acc['uid']}</code>)\n"
             f"🎛 <b>نوع الحساب:</b> {acc_mode_str}\n"
             f"💰 <b>{bal_label}:</b> <code>{bal_str}</code>\n"
@@ -1421,8 +1526,6 @@ class AboodControlBot:
             f"💵 <b>عائد التداول (Turnover):</b> <code>${turnover_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>الحدود (ربح/خسارة):</b> {limits_status}\n"
-            f"⚔️ <b>الشطرنج الشديد:</b> {strict_str}\n"
-            f"🕯️ <b>الشمعة السادسة:</b> {sixth_str}\n"
             f"🔭 <b>مستوى المسح:</b> <b>{self.get_scope_label()}</b>\n"
             f"📊 <b>المؤشرات والفلاتر:</b> {self.get_active_indicators_summary()}\n"
             f"👯 <b>المزدوج / الصفقات:</b> يمسك <code>{self.max_locked_pairs}</code> عملات | يدخل <code>{self.max_concurrent_trades}</code> صفقات\n"
@@ -1517,7 +1620,7 @@ class AboodControlBot:
                 self.reset_daily_stats()
 
     # ==========================================
-    # حلقة استقبال أوامر وأزرار تليجرام + تمرير خطوات الربط إلى Northflank
+    # حلقة استقبال أوامر وأزرار تليجرام
     # ==========================================
     async def telegram_polling_loop(self):
         offset = 0
@@ -1560,78 +1663,29 @@ class AboodControlBot:
 
                         asyncio.create_task(self.tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]}, req_timeout=10.0, retries=1))
 
-                        # أزرار الربط التلقائي عبر Northflank
-                        if data == "sd_login_start":
-                            self.awaiting_input = "SD_ACC_NAME"
+                        if data == "toggle_strategy_mode":
+                            self.strategy_mode = "AI" if self.strategy_mode == "CHESS" else "CHESS"
+                            self._save_bot_state()
+                            self.switch_pair_keep_global(f"التبديل إلى نظام {self.strategy_mode}")
+                            if self.strategy_mode == "AI":
+                                asyncio.create_task(self.subscribe_all_eligible_for_ai())
+                            log("STRATEGY", f"تم التبديل إلى وضع: {'الذكاء الاصطناعي AI 🧠' if self.strategy_mode == 'AI' else 'الشطرنج ♟'}")
+                        elif data == "set_ai_conf":
+                            self.awaiting_input = "AI_CONFIDENCE"
                             await self.send_admin(
-                                "🤖 <b>ربط تلقائي عبر متصفح Northflank السحابي</b>\n"
-                                "━━━━━━━━━━━━━━━━━━━━\n"
-                                "1️⃣ أرسل الآن <b>اسمًا مميزًا</b> لهذا الحساب (مثال: <code>حسابي الرئيسي</code>) أو اضغط تخطي:",
-                                {
-                                    "inline_keyboard": [
-                                        [{"text": "⏭ تخطي (اسم تلقائي)", "callback_data": "sd_skip_name"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
+                                "🧠 <b>ضبط حساسية ثقة الذكاء الاصطناعي (من 60% إلى 95%):</b>\n"
+                                "• <code>80</code> = متوازن وعالي الدقة (موصى به)\n"
+                                "• <code>88</code> = صارم جدًا (أقوى الانفجارات والارتدادات فقط)\n"
+                                "أرسل الآن النسبة المطلوبة:"
                             )
                             continue
-                        elif data == "sd_skip_name":
-                            self.temp_new_acc_name = f"حساب {len(self.accounts) + 1}"
-                            self.awaiting_input = None
-                            await self.tg_api("editMessageText", {
-                                "chat_id": ADMIN_CHAT_ID,
-                                "message_id": msg_id,
-                                "text": (
-                                    f"👤 <b>الحساب:</b> {html.escape(self.temp_new_acc_name)}\n"
-                                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:"
-                                ),
-                                "parse_mode": "HTML",
-                                "reply_markup": {
-                                    "inline_keyboard": [
-                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "sd_method_GOOGLE"}],
-                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "sd_method_EMAIL"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
-                            })
-                            continue
-                        elif data.startswith("sd_method_"):
-                            method_choice = data.replace("sd_method_", "")
-                            acc_nm = self.temp_new_acc_name or f"حساب {len(self.accounts) + 1}"
-                            self.awaiting_input = "SD_ACTIVE_FLOW"
-                            try:
-                                async with self.http_session.post(
-                                    f"{LINK_SERVICE_URL}/api/start_login",
-                                    json={"name": acc_nm, "method": method_choice},
-                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
-                                    timeout=aiohttp.ClientTimeout(total=20)
-                                ) as resp:
-                                    if resp.status != 200:
-                                        self.awaiting_input = None
-                                        await self.send_admin("⚠️ تعذر تشغيل خدمة الربط على Northflank. تأكد من تشغيل الخدمة وضبط LINK_SERVICE_URL.")
-                            except Exception as e:
-                                self.awaiting_input = None
-                                await self.send_admin(f"⚠️ تعذر الاتصال بخدمة Northflank: <code>{type(e).__name__}</code>")
-                            continue
-                        elif data in ("sd_cancel", "sd_shot"):
-                            kind_str = "CANCEL" if data == "sd_cancel" else "SHOT"
-                            if data == "sd_cancel":
-                                self.awaiting_input = None
-                            if LINK_SERVICE_URL:
-                                asyncio.create_task(self.http_session.post(
-                                    f"{LINK_SERVICE_URL}/api/forward_input",
-                                    json={"kind": kind_str},
-                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
-                                    timeout=aiohttp.ClientTimeout(total=10)
-                                ))
-                            continue
-
-                        if data == "cmd_start":
+                        elif data == "cmd_start":
                             self.is_running = True
                             self.awaiting_input = None
                             if self.limits_enabled:
                                 self.capture_start_balance_on_run()
+                            if self.strategy_mode == "AI":
+                                asyncio.create_task(self.subscribe_all_eligible_for_ai())
                             log("CTRL", "تم تشغيل البوت من لوحة الإدارة ▶️")
                         elif data == "cmd_stop":
                             self.is_running = False
@@ -1818,14 +1872,14 @@ class AboodControlBot:
                             self.awaiting_input = "DUAL_PAIRS"
                             await self.send_admin(
                                 "👯 <b>ضبط عدد العملات الممسوكة (المزدوج):</b>\n"
-                                "أرسل الآن عدد العملات التي يمسكها البوت لمراقبتها معًا قبل إغلاق الدقيقة (مثال: <code>3</code>):"
+                                "أرسل الآن عدد العملات التي يمسكها البوت لمراقبتها معًا (مثال: <code>3</code>):"
                             )
                             continue
                         elif data == "set_concurrent_trades":
                             self.awaiting_input = "CONCURRENT_TRADES"
                             await self.send_admin(
                                 f"🎯 <b>ضبط عدد الصفقات المتزامنة:</b>\n"
-                                f"أرسل الآن عدد الصفقات التي يدخلها البوت في نفس الوقت من بين العملات الممسوكة "
+                                f"أرسل الآن عدد الصفقات التي يدخلها البوت في نفس الوقت "
                                 f"(يلزم أن يكون الرقم <b>أقل أو يساوي {self.max_locked_pairs}</b>):"
                             )
                             continue
@@ -2047,6 +2101,8 @@ class AboodControlBot:
                             log("SCOPE", f"تم تغيير مستوى المسح إلى: {self.get_scope_label()}")
                             if self.mode in ("SCANNING", "LOCKED"):
                                 self.switch_pair_keep_global("تغيير مستوى المسح")
+                            if self.strategy_mode == "AI":
+                                asyncio.create_task(self.subscribe_all_eligible_for_ai())
                         elif data == "set_amount":
                             self.awaiting_input = "BASE_AMOUNT"
                             await self.send_admin("💵 أرسل الآن <b>المبلغ الأساسي</b> للصفقة (مثال: <code>10</code>):")
@@ -2086,7 +2142,6 @@ class AboodControlBot:
                     elif "message" in update:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
-                        msg_id_user = msg.get("message_id")
                         if chat_id != str(ADMIN_CHAT_ID):
                             continue
 
@@ -2106,13 +2161,6 @@ class AboodControlBot:
                             continue
 
                         if text in ("/start", "/menu", "القائمة"):
-                            if self.awaiting_input == "SD_ACTIVE_FLOW" and LINK_SERVICE_URL:
-                                asyncio.create_task(self.http_session.post(
-                                    f"{LINK_SERVICE_URL}/api/forward_input",
-                                    json={"kind": "CANCEL"},
-                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
-                                    timeout=aiohttp.ClientTimeout(total=10)
-                                ))
                             self.awaiting_input = None
                             await self.send_admin(self.format_dashboard_text(), self.build_main_keyboard())
                             continue
@@ -2137,44 +2185,24 @@ class AboodControlBot:
                             )
                             continue
 
-                        if self.awaiting_input == "SD_ACC_NAME":
-                            self.temp_new_acc_name = text[:30]
-                            self.awaiting_input = None
-                            await self.send_admin(
-                                f"👤 <b>الحساب:</b> {html.escape(self.temp_new_acc_name)}\n"
-                                f"━━━━━━━━━━━━━━━━━━━━\n"
-                                f"2️⃣ اختر طريقة تسجيل الدخول في <b>Pocket Option</b>:",
-                                {
-                                    "inline_keyboard": [
-                                        [{"text": "🔵 تسجيل الدخول عبر Google", "callback_data": "sd_method_GOOGLE"}],
-                                        [{"text": "📧 البريد الإلكتروني وكلمة المرور", "callback_data": "sd_method_EMAIL"}],
-                                        [{"text": "❌ إلغاء", "callback_data": "menu_accounts"}]
-                                    ]
-                                }
-                            )
-                            continue
-
-                        if self.awaiting_input == "SD_ACTIVE_FLOW" and LINK_SERVICE_URL:
+                        if self.awaiting_input == "AI_CONFIDENCE":
                             try:
-                                async with self.http_session.post(
-                                    f"{LINK_SERVICE_URL}/api/forward_input",
-                                    json={"kind": "TEXT", "text": text},
-                                    headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
-                                    timeout=aiohttp.ClientTimeout(total=10)
-                                ) as resp:
-                                    res_j = await resp.json()
-                                    if res_j.get("consumed") and "@" not in text and msg_id_user:
-                                        asyncio.create_task(self.tg_api(
-                                            "deleteMessage",
-                                            {"chat_id": ADMIN_CHAT_ID, "message_id": msg_id_user},
-                                            req_timeout=10.0,
-                                            retries=1
-                                        ))
-                            except Exception:
-                                pass
-                            continue
+                                pct_val = float(text.replace("%", ""))
+                                if 60 <= pct_val <= 95:
+                                    self.ai_min_confidence = pct_val / 100.0
+                                    self.ai_scorer.min_confidence = self.ai_min_confidence
+                                    self._save_bot_state()
+                                    self.awaiting_input = None
+                                    await self.send_admin(
+                                        f"✅ تم ضبط حساسية ثقة الذكاء الاصطناعي إلى <b>{int(pct_val)}%</b>.",
+                                        self.build_main_keyboard()
+                                    )
+                                else:
+                                    await self.send_admin("⚠️ أدخل نسبة بين 60 و 95 (مثال: <code>80</code>):")
+                            except ValueError:
+                                await self.send_admin("⚠️ أرسل رقم النسبة فقط (مثال: <code>80</code>):")
 
-                        if self.awaiting_input == "SET_DEMO_AUTH":
+                        elif self.awaiting_input == "SET_DEMO_AUTH":
                             ok, uid = self.update_active_account_single_mode(text, target_is_demo=True)
                             if ok:
                                 self.awaiting_input = None
@@ -2529,6 +2557,8 @@ class AboodControlBot:
             f"الأصول المفتوحة => العملات: {len(self.assets_by_cat['CURRENCIES'])} | "
             f"الكريبتو: {len(self.assets_by_cat['CRYPTO'])} | الأسهم: {len(self.assets_by_cat['STOCKS'])}"
         )
+        if self.strategy_mode == "AI" and self.authenticated:
+            asyncio.create_task(self.subscribe_all_eligible_for_ai())
 
     def is_pair_eligible(self, asset: str) -> tuple[bool, int]:
         payout = self.payouts.get(asset)
@@ -2638,6 +2668,9 @@ class AboodControlBot:
         return (m5, m4, m3, m2, m1, m_open), (c5, c4, c3, c2, c1, c_open)
 
     def print_five_candles(self, asset: str, force: bool = False):
+        if self.strategy_mode == "AI":
+            return
+
         if self.sixth_candle_enabled:
             data6 = self.get_last_six(asset)
             if data6 is None:
@@ -2710,7 +2743,8 @@ class AboodControlBot:
         signal_uid: int | None,
         is_draw_retry: bool = False,
         is_cont_entry: bool = False,
-        cycle_base: float | None = None
+        cycle_base: float | None = None,
+        ai_confidence: float | None = None
     ):
         if not self.ws or not self.authenticated or not self.is_running:
             return
@@ -2741,7 +2775,19 @@ class AboodControlBot:
         sig_sym = self.format_signal_symbol(asset)
         dir_text = "🟢 CALL UP 📈" if direction == "call" else "🔴 PUT DOWN 📉"
 
-        if is_cont_entry:
+        if ai_confidence is not None and signal_uid is None:
+            now_entry_str = datetime.now(tz=TZ_UTC3).strftime("%H:%M:%S")
+            ai_msg = (
+                f"╭━━━[ 🛡 عبود تريدينج • AI ]━╮\n"
+                f"┃ 🧠 <b>قنص لحظي بالذكاء الاصطناعي</b>\n"
+                f"┃ 🏛 <code>{sig_sym}</code>\n"
+                f"┃ 🎯 الثقة: <b>{int(ai_confidence * 100)}%</b> | ⏱ M1\n"
+                f"┃ ⏰ Entry  <code>{now_entry_str}</code> [UTC+3]\n"
+                f"┃ {dir_text}\n"
+                f"╰━━━━━━━━━━━━━━━━━━━╯"
+            )
+            signal_uid = self.enqueue_new_signal(ai_msg)
+        elif is_cont_entry:
             cont_msg = (
                 f"╭━━━[ 🛡 عبود تريدينج ]━╮\n"
                 f"┃ 🔄 <b>مواصلة النموذج (دخول عكسي)</b>\n"
@@ -2793,7 +2839,8 @@ class AboodControlBot:
         await self.ws.send(f'42["openOrder",{json.dumps(order_payload)}]')
 
         mode_tag = "DEMO" if self.is_demo_mode else "LIVE"
-        tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else (" (مواصلة النموذج 🔄)" if is_cont_entry else "")
+        ai_tag = f" [AI {int(ai_confidence * 100)}%]" if ai_confidence is not None else ""
+        tag_note = " (إعادة بعد تعادل ⚖️)" if is_draw_retry else (" (مواصلة النموذج 🔄)" if is_cont_entry else ai_tag)
         log(
             "TRADE_EXEC",
             f"⚡ تنفيذ [{mode_tag}]{tag_note} | {sig_sym} | {dir_text} | المبلغ: ${amount} (أساس الدورة: ${cycle_base:g}) | "
@@ -2958,7 +3005,6 @@ class AboodControlBot:
                         continue
 
                     # ج) حالة الخسارة (LOSS)
-                    # فحص حد الخسارة بعد انتهاء الصفقة وخسارتها
                     if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
                         break
 
@@ -3034,10 +3080,9 @@ class AboodControlBot:
                             )
 
             # ========================================================
-            # 2) فحص الأزواج المجهّزة في قائمة الانتظار
+            # 2) فحص الأزواج المجهّزة في قائمة الانتظار (وضع الشطرنج)
             # ========================================================
             if self.locked_candidates and self.is_running:
-                # التحقق الفوري من الحدود قبل فتح أي صفقة مجهزة
                 if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
                     continue
 
@@ -3186,8 +3231,78 @@ class AboodControlBot:
                 f"🏆 المطلوب: <code>{self.boost_target_wins} صفقات ناجحة</code> للعودة للأساسي الأصلي."
             ))
 
+    # ==========================================
+    # محرك الذكاء الاصطناعي اللحظي لجميع العملات (AI Sniper)
+    # ==========================================
+    async def process_ai_tick_logic(self, asset: str, price: float, now_ts: float):
+        if not self.is_running or self.strategy_mode != "AI":
+            return
+
+        if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
+            return
+
+        if asset not in self.get_active_scan_pairs():
+            return
+
+        eligible, payout = self.is_pair_eligible(asset)
+        if not eligible:
+            return
+
+        active_assets = {t["asset"] for t in self.active_trades}
+        if asset in active_assets:
+            return
+
+        max_to_open = min(self.max_concurrent_trades, self.max_locked_pairs)
+        if len(self.active_trades) >= max_to_open:
+            return
+
+        direction, confidence = self.ai_scorer.evaluate_tick(asset, price, now_ts)
+        if direction is None:
+            return
+
+        if self.indicators_enabled:
+            ind_ok, ind_reason = self.check_indicators(asset, direction, is_pre_close=False)
+            if not ind_ok:
+                log("AI_IND_SKIP", f"🧠 تخطي فرصة AI على {asset} ({int(confidence * 100)}%) بسبب المؤشرات: {ind_reason}")
+                return
+
+        if self.martingale_enabled:
+            if self.pending_martingale_steps:
+                step_to_use, carried_base = self.pending_martingale_steps.pop(0)
+            elif not any(t["g_idx"] > 0 for t in self.active_trades):
+                step_to_use = self.global_step_index
+                carried_base = None
+            else:
+                step_to_use = 0
+                carried_base = None
+        else:
+            step_to_use = 0
+            carried_base = None
+
+        curr_minute = (int(now_ts) // 60) * 60
+        log(
+            "AI_SNIPER",
+            f"🧠 اقتناص فرصة AI فورية | {asset} ({payout}%) | {direction.upper()} | ثقة: {int(confidence * 100)}%"
+        )
+        await self.open_trade(
+            asset,
+            direction,
+            g_idx=step_to_use,
+            p_idx=0,
+            trade_minute=curr_minute,
+            signal_uid=None,
+            cycle_base=carried_base,
+            ai_confidence=confidence
+        )
+
+    # ==========================================
+    # منطق السوق (يوجّه بين AI اللحظي أو الشطرنج الاعتيادي)
+    # ==========================================
     async def process_market_logic(self, asset: str, force_print: bool = False):
         if not self.is_running:
+            return
+
+        if self.strategy_mode == "AI":
             return
 
         if self.account_balance is not None and self.check_and_enforce_limits(float(self.account_balance)):
@@ -3213,7 +3328,6 @@ class AboodControlBot:
             if asset in locked_assets or asset in active_assets:
                 return
 
-            # تحديد النمط حسب تفعيل أو إيقاف «الشمعة السادسة»
             if self.sixth_candle_enabled:
                 data6 = self.get_last_six(asset)
                 if data6 is None:
@@ -3337,6 +3451,8 @@ class AboodControlBot:
             acc = self.get_active_account()
             mode_label = "التجريبي (Demo)" if self.is_demo_mode else "الحقيقي (Live)"
             log("AUTH", f"تم تأكيد المصادقة للحساب [{acc['name']} | {acc['uid']}] في الوضع {mode_label} ✅")
+            if self.strategy_mode == "AI":
+                asyncio.create_task(self.subscribe_all_eligible_for_ai())
             return
 
         if event_name == "updateAssets" and isinstance(data, list):
@@ -3381,7 +3497,9 @@ class AboodControlBot:
                     if isinstance(item, list) and len(item) >= 3:
                         asset, ts, price = str(item[0]), item[1], float(item[2])
                         self.update_candle_from_tick(asset, ts, price)
-                        if self.fast_mode or self.mode == "SCANNING" or asset in locked_assets or asset in active_assets:
+                        if self.strategy_mode == "AI":
+                            await self.process_ai_tick_logic(asset, price, self.get_server_now())
+                        elif self.fast_mode or self.mode == "SCANNING" or asset in locked_assets or asset in active_assets:
                             await self.process_market_logic(asset, force_print=False)
             return
 
@@ -3425,6 +3543,12 @@ class AboodControlBot:
         while True:
             if not self.is_running:
                 await asyncio.sleep(1)
+                continue
+
+            # في وضع الذكاء الاصطناعي AI: يشترك في جميع العملات المفتوحة دفعة واحدة ويراقب التيكات الحية
+            if self.strategy_mode == "AI":
+                await self.subscribe_all_eligible_for_ai()
+                await asyncio.sleep(4)
                 continue
 
             if not self.fast_mode and self.active_trades:
@@ -3499,64 +3623,23 @@ class AboodControlBot:
                 self.print_five_candles(pair, force=True)
 
     # ==========================================
-    # خادم الويب المدمج ومستقبل الربط السحابي (Northflank Webhook)
+    # خادم الويب المدمج لإبقاء البوت نشطًا على Render
     # ==========================================
     async def start_keepalive_web_server(self):
         async def health_handler(request):
             status = "RUNNING" if self.is_running else "PAUSED"
-            return web.Response(text=f"Abood Auto Trader Bot is alive! Status: {status}")
-
-        async def webhook_link_account_handler(request):
-            secret = request.headers.get("X-Link-Secret", "")
-            if not LINK_WEBHOOK_SECRET or secret != LINK_WEBHOOK_SECRET:
-                return web.Response(text="Unauthorized", status=401)
-
-            try:
-                data = await request.json()
-            except Exception:
-                return web.Response(text="Invalid JSON", status=400)
-
-            name = str(data.get("name", "حساب الهاتف")).strip() or "حساب الهاتف"
-            uid = str(data.get("uid", "Unknown")).strip() or "Unknown"
-            demo_s = str(data.get("demo_session", "")).strip()
-            live_s = str(data.get("live_session", "")).strip()
-
-            if not demo_s and not live_s:
-                return web.Response(text="Missing session", status=400)
-
-            self.awaiting_input = None
-            acc = self.register_captured_account(name, uid, demo_s, live_s)
-            self.full_reset_to_scanning("ربط حساب عبر Northflank")
-            log("WEBHOOK_AUTH", f"🌐 تم استلام وربط الحساب: {acc['name']} (UID: {acc['uid']})")
-
-            safe_name = html.escape(acc["name"])
-            live_st = "مضبوطة ✅" if acc.get("has_dedicated_live") else "غير مضبوطة ⚠️"
-            asyncio.create_task(self.send_admin(
-                f"🌐 <b>تم ربط حساب جديد تلقائيًا عبر Northflank!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>الاسم:</b> {safe_name}\n"
-                f"🆔 <b>الآيدي (UID):</b> <code>{acc['uid']}</code>\n"
-                f"🧪 <b>الديمو (Demo):</b> مضبوطة ✅\n"
-                f"💵 <b>الحقيقي (Live):</b> {live_st}",
-                self.build_main_keyboard()
-            ))
-
-            if self.ws:
-                asyncio.create_task(self.ws.close())
-
-            return web.json_response({"ok": True, "uid": acc["uid"]})
+            return web.Response(text=f"Abood Auto Trader Bot is alive! Status: {status} | Mode: {self.strategy_mode}")
 
         app = web.Application()
         app.router.add_get("/", health_handler)
         app.router.add_get("/health", health_handler)
-        app.router.add_post("/api/webhook/link_account", webhook_link_account_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.getenv("PORT", "10000"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log("WEB", f"تم تشغيل خادم المراقبة ومستقبل الربط على المنفذ {port} ✅")
+        log("WEB", f"تم تشغيل خادم المراقبة على المنفذ {port} ✅")
 
     async def run(self):
         headers = {
